@@ -2,6 +2,8 @@
 # Linux client end-to-end harness. Runs INSIDE the client container as root.
 # The repo is mounted read-only at /repo. The fake cache is reachable as
 # cache.facility.innovationtreehouse.org -> 172.28.0.50 on the fixture network.
+# ck takes the status of the preceding [ ] / pipeline test; SC2319 flags that intended use.
+# shellcheck disable=SC2319
 set -u
 PASS=0
 FAIL=0
