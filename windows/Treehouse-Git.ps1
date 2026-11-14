@@ -7,6 +7,6 @@ $ErrorActionPreference = 'Stop'
 Import-Module (Join-Path (Split-Path -Parent $MyInvocation.MyCommand.Path) 'FacilityCache.psm1') -Force
 switch ($Command) {
     'signin' { if (-not (Start-TreehouseGitSession)) { exit 1 } }
-    'signout' { Reset-TreehouseGitSession; Write-FcOk 'signed out of GitHub' }
+    'signout' { if (Reset-TreehouseGitSession) { Write-FcOk 'signed out of GitHub' } else { exit 1 } }
     'status' { Show-TreehouseGitSession }
 }

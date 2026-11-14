@@ -11,20 +11,35 @@ on:
 # cache, wrong-address, off-site, unmanaged-file protection, update --check,
 # repo-id pin refusal, full update with attestation, uninstall.
 
+# The harness reads this (private) repo's releases and their attestations
+# with GITHUB_TOKEN: contents: read for the releases, attestations: read for
+# GET /repos/{owner}/{repo}/attestations/{digest}.
+permissions:
+  contents: read
+  attestations: read
+
+# The jobs hand GITHUB_TOKEN to a --privileged container running repo code.
+# Fork PRs (only possible if the repo is public again) are skipped; same-repo
+# PRs, pushes to main and manual runs still run.
 jobs:
   linux:
+    if: github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository
     runs-on: ubuntu-latest
     strategy:
       fail-fast: false
       matrix:
         base: ["ubuntu:24.04", "ubuntu:26.04"]
     steps:
-      - uses: actions/checkout@08c6903cd8c0fde910a37f88322edcfb5dd907a8 # v5.0.0
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
 
       - name: Build fixture images
+        env:
+          BASE: ${{ matrix.base }}
         run: |
           docker build -t fc-cache:e2e tests/e2e/cache
-          docker build -t fc-client:e2e --build-arg BASE=${{ matrix.base }} -f tests/e2e/linux/client.Dockerfile tests/e2e/linux
+          docker build -t fc-client:e2e --build-arg BASE="$BASE" -f tests/e2e/linux/client.Dockerfile tests/e2e/linux
 
       - name: Start cache and client (systemd) containers
         run: |
@@ -46,9 +61,12 @@ jobs:
         run: docker logs fc-cache 2>&1 | tail -40
 
   windows-container:
+    if: github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository
     runs-on: windows-2022
     steps:
-      - uses: actions/checkout@08c6903cd8c0fde910a37f88322edcfb5dd907a8 # v5.0.0
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
 
       - name: Windows-container E2E (servercore ltsc2022 client, PS 5.1)
         shell: powershell

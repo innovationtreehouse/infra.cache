@@ -68,7 +68,8 @@ before walking away.
 - Commit email is `<id>+<login>@users.noreply.github.com`.
 - Linux: the session lives in `$XDG_RUNTIME_DIR/treehouse-gh`. At login,
   `~/.git-credentials` and `~/.config/gh/hosts.yml` are deleted.
-- Windows: the session lives in `%ProgramData%\FacilityCache\gh-session`.
+- Windows: the session lives in a per-session folder that is wiped at
+  logon, logoff and expiry.
 
 ## VS Code and other apps: do not sign in to GitHub inside them
 

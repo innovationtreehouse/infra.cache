@@ -92,5 +92,19 @@ check signout-removes 0 "$([[ ! -e "$S" ]] && echo 0 || echo 1)"
 grep -q gho_faketoken123 "$CURL_LOG"
 check signout-revokes 0 $?
 
+# Links inside the session are user-controlled: never followed, session still wiped.
+printf 'github.com:\n  oauth_token: gho_elsewhere456\n' >"$TMP/elsewhere.yml"
+fake_session "" "x"
+ln -sf "$TMP/elsewhere.yml" "$S/gh/hosts.yml"
+"$TG" sweep
+check symlinked-hosts-not-sent 0 "$([[ ! -s "$CURL_LOG" ]] && echo 0 || echo 1)"
+check symlinked-hosts-session-removed 0 "$([[ ! -e "$S" ]] && echo 0 || echo 1)"
+check symlink-target-untouched 0 "$([[ -f "$TMP/elsewhere.yml" ]] && echo 0 || echo 1)"
+mkdir -p "$TMP/elsedir" "$S" && cp "$TMP/elsewhere.yml" "$TMP/elsedir/hosts.yml" && : >"$CURL_LOG"
+ln -s "$TMP/elsedir" "$S/gh"
+"$TG" sweep
+check symlinked-gh-dir-not-sent 0 "$([[ ! -s "$CURL_LOG" ]] && echo 0 || echo 1)"
+check symlinked-gh-dir-session-removed 0 "$([[ ! -e "$S" ]] && echo 0 || echo 1)"
+
 echo "treehouse-git: $pass passed, $fail failed"
 [[ "$fail" -eq 0 ]]

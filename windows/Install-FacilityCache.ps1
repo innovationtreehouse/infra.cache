@@ -31,10 +31,13 @@ if (Test-Path $verFile) {
     $described = (& git -C $root describe --tags --match 'v*' --dirty 2>$null)
     if ($LASTEXITCODE -eq 0 -and $described) { $ver = ([string]$described).Trim().TrimStart('v') }
 }
+# Before anything (even the log) touches it: SYSTEM tasks run code and read
+# config/token from here, so non-admins must not own or create anything in it.
+$hardenNotes = @(Protect-FacilityCacheInstallDir)
 Write-FcHeader 'facility-cache-client' "install  v$ver"
+foreach ($n in $hardenNotes) { Write-FcWarn $n }
 
 Write-FcStep 'files' 'copying into ProgramData'
-New-Item -ItemType Directory -Path $dest -Force | Out-Null
 foreach ($name in @(
     'FacilityCache.psm1',
     'FacilityCache-Apply.ps1',
@@ -59,10 +62,11 @@ if (Test-Path $srcShared) {
 }
 # SystemRoot is on every PATH for every user from the first logon, and members
 # cannot modify it, so no PATH edits are needed. Git Bash does not apply PATHEXT:
-# there the command is `treehouse-git.cmd`.
+# there the command is `treehouse-git.cmd`. powershell.exe by absolute path: cmd
+# would otherwise pick up a powershell.exe in the current directory (a clone).
 @(
     '@echo off',
-    'powershell.exe -NoProfile -ExecutionPolicy Bypass -File "%ProgramData%\FacilityCache\Treehouse-Git.ps1" %*'
+    '"%SystemRoot%\System32\WindowsPowerShell\v1.0\powershell.exe" -NoProfile -ExecutionPolicy Bypass -File "%ProgramData%\FacilityCache\Treehouse-Git.ps1" %*'
 ) | Set-Content -LiteralPath (Join-Path $env:SystemRoot 'treehouse-git.cmd') -Encoding ASCII
 # Always record the resolved version (zip VERSION, git describe, or dev).
 $ver | Set-Content -LiteralPath (Join-Path $dest 'VERSION') -Encoding ASCII
@@ -112,11 +116,13 @@ Invoke-FacilityCacheApply
 Write-FcStepOk 'pip/npm/uv follow the facility LAN'
 
 Write-FcStep 'tasks' 'apply + update + session reset'
+# Absolute, so no PATH entry or working directory can supply the interpreter.
+$powershell = Join-Path $env:SystemRoot 'System32\WindowsPowerShell\v1.0\powershell.exe'
 $taskName = 'FacilityCache-Apply'
 Unregister-ScheduledTask -TaskName $taskName -Confirm:$false -ErrorAction SilentlyContinue
 
 $arg = "-NoProfile -WindowStyle Hidden -ExecutionPolicy Bypass -File `"$(Join-Path $dest 'FacilityCache-Apply.ps1')`""
-$action = New-ScheduledTaskAction -Execute 'powershell.exe' -Argument $arg
+$action = New-ScheduledTaskAction -Execute $powershell -Argument $arg
 $principal = New-ScheduledTaskPrincipal -UserId 'SYSTEM' -LogonType ServiceAccount -RunLevel Highest
 $repeat = New-ScheduledTaskTrigger -Once -At (Get-Date).AddMinutes(1) `
     -RepetitionInterval (New-TimeSpan -Minutes 5) `
@@ -149,7 +155,7 @@ Register-ScheduledTask -TaskName $taskName -Action $action -Trigger $triggers -P
 $updateName = 'FacilityCache-Update'
 Unregister-ScheduledTask -TaskName $updateName -Confirm:$false -ErrorAction SilentlyContinue
 $updateArg = "-NoProfile -WindowStyle Hidden -ExecutionPolicy Bypass -File `"$(Join-Path $dest 'FacilityCache-Update.ps1')`""
-$updateAction = New-ScheduledTaskAction -Execute 'powershell.exe' -Argument $updateArg
+$updateAction = New-ScheduledTaskAction -Execute $powershell -Argument $updateArg
 # -RandomDelay must be given to the cmdlet: assigning the property afterwards
 # serializes the TimeSpan as '00:30:00' instead of ISO8601 'PT30M' on some
 # Windows builds (seen on servercore ltsc2022), and Register-ScheduledTask
@@ -167,7 +173,7 @@ Register-ScheduledTask -TaskName $updateName -Action $updateAction -Trigger $upd
 $resetName = 'FacilityCache-SessionReset'
 Unregister-ScheduledTask -TaskName $resetName -Confirm:$false -ErrorAction SilentlyContinue
 $resetArg = "-NoProfile -WindowStyle Hidden -ExecutionPolicy Bypass -Command `"Import-Module '$(Join-Path $dest 'FacilityCache.psm1')'; Reset-TreehouseGitSession`""
-$resetAction = New-ScheduledTaskAction -Execute 'powershell.exe' -Argument $resetArg
+$resetAction = New-ScheduledTaskAction -Execute $powershell -Argument $resetArg
 $resetTriggers = @(
     (New-ScheduledTaskTrigger -AtStartup),
     (New-ScheduledTaskTrigger -AtLogOn)

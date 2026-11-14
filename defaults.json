@@ -7,7 +7,7 @@
   "DockerHubPort": 5000,
   "DockerGhcrPort": 5001,
   "ProbeTimeoutMs": 1000,
-  "GitHubRepo": "innovationtreehouse/cache",
+  "GitHubRepo": "innovationtreehouse/infra.cache",
   "GitHubRepoId": 1343160243,
   "AutoUpdate": true,
   "SharedMachine": false,

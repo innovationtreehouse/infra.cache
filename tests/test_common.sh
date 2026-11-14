@@ -57,6 +57,52 @@ check gh-url-offsite "https://cli.github.com/packages" "$(github_cli_packages_ur
 on_facility() { return 0; }
 check gh-url-onsite "http://cache.test.example:1111/cli.github.com/packages" "$(github_cli_packages_url)"
 
+# gh keyring pin: GitHub's real keyring passes; a foreign key alone, appended to
+# the real ones, or ASCII armor fails. The foreign key is a bare v4 key packet.
+REAL_KR="$ROOT/tests/fixtures/githubcli-archive-keyring.gpg"
+printf '\x98\x05\x04evil' >"$TMP/evil.gpg"
+cat "$REAL_KR" "$TMP/evil.gpg" >"$TMP/mixed.gpg"
+printf -- '-----BEGIN PGP PUBLIC KEY BLOCK-----\n' >"$TMP/armor.gpg"
+for k in "$REAL_KR:0" "$TMP/evil.gpg:1" "$TMP/mixed.gpg:1" "$TMP/armor.gpg:1"; do
+  github_cli_keyring_ok "${k%:*}" && r=0 || r=1
+  check "keyring-pin-$(basename "${k%:*}")" "${k##*:}" "$r"
+done
+
+# install_keyring: fetched only from https://cli.github.com, even on-site (a
+# hostile "cache" must never supply it), never installed unless pinned, and a
+# bad keyring already on disk is removed rather than trusted.
+GH_CLI_KEYRING="$TMP/apt/keyring.gpg"
+GH_CLI_LIST="$TMP/apt/gh.list"
+FETCHES=0
+SERVE="$TMP/evil.gpg"
+github_cli_https_get() {
+  FETCHES=$((FETCHES + 1))
+  FETCH_URL="$1"
+  cp "$SERVE" "$2"
+}
+on_facility() { return 0; }
+mkdir -p "$TMP/apt"
+cp "$TMP/mixed.gpg" "$GH_CLI_KEYRING"
+printf '# %s\n' "$MANAGED_MARKER" >"$GH_CLI_LIST"
+github_cli_write_source 2>/dev/null && r=0 || r=1
+check keyring-hostile-refused 1 "$r"
+check keyring-fetch-url "https://cli.github.com/packages/githubcli-archive-keyring.gpg" "$FETCH_URL"
+[[ -e "$GH_CLI_KEYRING" ]] && r=present || r=gone
+check keyring-bad-existing-removed gone "$r"
+[[ -e "$GH_CLI_LIST" ]] && r=present || r=gone
+check keyring-bad-source-removed gone "$r"
+SERVE="$REAL_KR"
+github_cli_write_source 2>/dev/null && r=0 || r=1
+check keyring-real-installed 0 "$r"
+cmp -s "$REAL_KR" "$GH_CLI_KEYRING" && r=0 || r=1
+check keyring-real-content 0 "$r"
+FETCHES=0
+github_cli_write_source 2>/dev/null && r=0 || r=1
+check keyring-good-kept 0 "$r"
+check keyring-good-not-refetched 0 "$FETCHES"
+grep -q "signed-by=$GH_CLI_KEYRING" "$GH_CLI_LIST" && r=0 || r=1
+check keyring-source-signed-by 0 "$r"
+
 # file_is_managed: marker present / absent / missing file
 printf '# %s\nkey=1\n' "$MANAGED_MARKER" >"$TMP/managed"
 printf 'key=1\n' >"$TMP/unmanaged"

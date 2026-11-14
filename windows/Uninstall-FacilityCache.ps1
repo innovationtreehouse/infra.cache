@@ -41,16 +41,11 @@ Unregister-ScheduledTask -TaskName 'FacilityCache-Update' -Confirm:$false -Error
 Unregister-ScheduledTask -TaskName 'FacilityCache-SessionReset' -Confirm:$false -ErrorAction SilentlyContinue
 Write-FcStepOk 'Apply + Update + SessionReset unregistered'
 
-# Shared-machine GitHub session: revoke + wipe while the module is still loaded
-# (the files step below then removes the gh-session dir itself).
-if (Get-Command Reset-TreehouseGitSession -ErrorAction SilentlyContinue) {
-    Reset-TreehouseGitSession
-}
-if (Get-Command git -ErrorAction SilentlyContinue) {
-    $include = (Join-Path $dest 'shared.gitconfig').Replace('\', '/')
-    if (@(& git config --system --get-all include.path) -contains $include) {
-        & git config --system --fixed-value --unset-all include.path $include
-    }
+# Shared-machine GitHub sign-in: revoke + delete every profile's session, drop
+# the user-scope env vars (also from hives of accounts not logged on) and the
+# system git include, while the module is still loaded.
+if (Get-Command Disable-TreehouseGitSharedMachine -ErrorAction SilentlyContinue) {
+    Disable-TreehouseGitSharedMachine -IncludeUnloaded
 }
 Remove-Item -LiteralPath (Join-Path $env:SystemRoot 'treehouse-git.cmd') -Force -ErrorAction SilentlyContinue
 

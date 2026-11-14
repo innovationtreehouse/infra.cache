@@ -24,11 +24,27 @@ Usage: treehouse-git signin|signout|status
 EOT
 }
 
-# Revoke every gh*_ token found in a hosts.yml. Unauthenticated on purpose:
-# GitHub rejects this endpoint when an Authorization header is present.
+# Print session dir $1's gh/hosts.yml. The user owns everything under it and
+# can swap entries at any time, so refuse links, and when root (the sweep) read
+# it as the uid named by the $RUN_BASE/<uid>/ path (logind's, not the user's):
+# a link swapped in after the check then reaches only what that user can read.
+read_hosts() {
+  local f="$1/gh/hosts.yml" uid
+  [[ -d "$1/gh" && ! -L "$1/gh" && -f "$f" && ! -L "$f" ]] || return 1
+  if [[ "$(id -u)" -ne 0 ]]; then
+    cat -- "$f"
+    return
+  fi
+  uid="$(basename "$(dirname "$1")")"
+  [[ "$uid" =~ ^[0-9]+$ ]] || return 1
+  setpriv --reuid="$uid" --regid="$(id -g "$uid")" --clear-groups -- cat -- "$f"
+}
+
+# Revoke every gh*_ token found in session $1's hosts.yml. Unauthenticated on
+# purpose: GitHub rejects this endpoint when an Authorization header is present.
 revoke_tokens() {
   local tokens json
-  tokens="$(sed -n 's/^[[:space:]]*oauth_token:[[:space:]]*//p' "$1" 2>/dev/null |
+  tokens="$(read_hosts "$1" 2>/dev/null | sed -n 's/^[[:space:]]*oauth_token:[[:space:]]*//p' |
     tr -d "\"'\r " | grep -E '^gh[a-z]_[A-Za-z0-9_]+$' | sort -u || true)"
   [[ -n "$tokens" ]] || return 0
   json="$(printf '%s\n' "$tokens" | sed 's/.*/"&"/' | paste -sd, -)"
@@ -40,7 +56,7 @@ revoke_tokens() {
 end_session() {
   local d="$1"
   [[ -d "$d" && ! -L "$d" ]] || return 0
-  if ! revoke_tokens "$d/gh/hosts.yml"; then
+  if ! revoke_tokens "$d"; then
     echo "treehouse-git: token removed locally but could not be revoked on GitHub" >&2
   fi
   rm -rf "$d"

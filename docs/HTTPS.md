@@ -29,6 +29,11 @@ pip, npm, and Docker currently need `trusted-host` / `allow-insecure-host` /
 OS already trusts lets those clients use `https://` and drop those
 bypasses.
 
+This is also the only fix for spoofed on-site detection: on a hostile
+network that answers the cache name with `10.41.1.50`, today's client points
+pip/npm/Docker at the attacker over plain HTTP (see
+[`SECURITY.md`](SECURITY.md#lan-trust-not-transport-security)).
+
 TLS authenticates the **name**. The IP pin authenticates **which box on
 this LAN** we meant. They stack; neither replaces the other:
 
@@ -36,11 +41,11 @@ this LAN** we meant. They stack; neither replaces the other:
 |---|---|---|
 | Off-site, name NXDOMAINs | Fail | Fail |
 | Another LAN with a host at the same IP, name does not resolve | Fail | Fail |
-| DNS poisoned so the name is `.200` but that is not our host | Pass | Fail (no private key) |
+| DNS poisoned so the name is `10.41.1.50` but that is not our host | Pass | Fail (no private key) |
 | DNS poisoned to some other IP | Fail | Fail (wrong/no cert) |
-| ARP spoof of `.200` without the key | Pass | Fail |
-| PEMs copied onto the wrong machine, UniFi still points at `.200` | Fail | Would pass if the client skipped the pin |
-| Real cache host compromised, or the key stolen and used on `.200` | Pass | Pass |
+| ARP spoof of `10.41.1.50` without the key | Pass | Fail |
+| PEMs copied onto the wrong machine, UniFi still points at `10.41.1.50` | Fail | Would pass if the client skipped the pin |
+| Real cache host compromised, or the key stolen and used on `10.41.1.50` | Pass | Pass |
 
 The last row is **not** a TLS problem. A stolen or in-use key means pip and
 Docker will trust the channel. Content authentication is separate: apt
@@ -58,7 +63,7 @@ time; older ACM certs cannot be exported later):
 
 1. DNS-validate in the public `innovationtreehouse.org` zone (ACM CNAME
    only). Do not create a public A record for the cache name.
-2. Export PEM + chain + encrypted key. Decrypt only on `.200`, mode `600`.
+2. Export PEM + chain + encrypted key. Decrypt only on `10.41.1.50`, mode `600`.
    Never commit the key.
 3. ACM renews **in ACM**. A job must re-export and reload the proxy before
    expiry (~395 days).
@@ -71,7 +76,7 @@ custom CA.
 
 ## On the box
 
-Terminate TLS on `.200` in front of the HTTP backends (Caddy or nginx, or
+Terminate TLS on `10.41.1.50` in front of the HTTP backends (Caddy or nginx, or
 the registry's own TLS). Same cert on every HTTPS port. Firewall still
 LAN-only, no NAT, no VPN export of that zone.
 
@@ -91,7 +96,7 @@ Keep the port numbers. Do not serve HTTP and HTTPS on the same port.
 `FacilityCache.psm1` switch those four endpoints to `https://`. Then:
 
 - **pip / uv** — stop writing `trusted-host` / `allow-insecure-host`.
-  `on_facility "$PYPI_PORT"` stays (DNS is `.200` and TCP :3141 answers;
+  `on_facility "$PYPI_PORT"` stays (DNS is `10.41.1.50` and TCP :3141 answers;
   TLS is after TCP).
 - **npm** — registry URL `https://…:4873/`. Same probe.
 - **Docker** — `registry-mirrors` becomes `https://host:5000` (and GHCR
@@ -121,7 +126,7 @@ or ship a client release that updates `defaults.*`.
 
 ## Rollout
 
-1. Cert issued and loaded on `.200` for 3141/4873/5000/5001. Confirm
+1. Cert issued and loaded on `10.41.1.50` for 3141/4873/5000/5001. Confirm
    `openssl s_client -connect 10.41.1.50:3141 -servername cache.facility.innovationtreehouse.org`
    from a LAN host, and NXDOMAIN for that name off-site.
 2. Client release: `https://` URLs, drop the HTTP bypasses, **keep**

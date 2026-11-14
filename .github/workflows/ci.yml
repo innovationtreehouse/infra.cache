@@ -8,11 +8,16 @@ on:
 # Shell files are matched by extension OR bash/sh shebang, same matcher as
 # release.yml's lint job.
 
+permissions:
+  contents: read
+
 jobs:
   format:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@08c6903cd8c0fde910a37f88322edcfb5dd907a8 # v5.0.0
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
       - name: shfmt (shell, 2-space indent)
         run: |
           curl -sSLo /usr/local/bin/shfmt \
@@ -29,13 +34,16 @@ jobs:
           shfmt -i 2 -d $files
       - name: ruff format (python)
         run: |
+          # version-pinned; hash-pinning (pip --require-hashes) is optional extra hardening
           pipx install ruff==0.12.4
           ruff format --check .
 
   lint:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@08c6903cd8c0fde910a37f88322edcfb5dd907a8 # v5.0.0
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
       - name: shellcheck (runner-preinstalled)
         run: |
           shellcheck --version
@@ -53,7 +61,7 @@ jobs:
       - name: PSScriptAnalyzer (powershell; gate on Error, print all)
         shell: pwsh
         run: |
-          Install-Module -Name PSScriptAnalyzer -Force -Scope CurrentUser
+          Install-Module -Name PSScriptAnalyzer -RequiredVersion 1.25.0 -Force -Scope CurrentUser
           $findings = Get-ChildItem -Recurse -Path windows -Include *.ps1,*.psm1 |
             ForEach-Object { Invoke-ScriptAnalyzer -Path $_.FullName }
           $findings | Format-Table -AutoSize | Out-String | Write-Host
@@ -68,7 +76,9 @@ jobs:
     # on a windows-latest runner.
     runs-on: windows-latest
     steps:
-      - uses: actions/checkout@08c6903cd8c0fde910a37f88322edcfb5dd907a8 # v5.0.0
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
       - name: Parser::ParseFile + BOM check (Windows PowerShell 5.1)
         shell: powershell
         run: |
@@ -94,7 +104,9 @@ jobs:
   test:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@08c6903cd8c0fde910a37f88322edcfb5dd907a8 # v5.0.0
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
       - name: python unit tests
         run: python3 -m unittest discover -s tests -v
       - name: shell self-check

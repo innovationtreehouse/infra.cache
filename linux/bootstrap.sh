@@ -1,5 +1,10 @@
 #!/bin/bash
-# First-install from GitHub Releases. Safe to curl | sudo bash
+# First-install from GitHub Releases, as root. Nothing from the downloaded
+# tarball runs until its sha256 matches and, when gh is available (installed
+# here from cli.github.com over HTTPS if missing), its GitHub attestation
+# verifies; without gh it installs on sha256 alone and says so. `curl | sudo
+# bash` trusts this script itself on TLS to GitHub only, so prefer downloading
+# it and checking its attestation first (see README.md).
 set -euo pipefail
 
 # Minimal visuals before the package (and ui.sh) is on disk.
@@ -30,7 +35,7 @@ if [[ "$(id -u)" -ne 0 ]]; then
   exit 1
 fi
 
-REPO="${GITHUB_REPO:-innovationtreehouse/cache}"
+REPO="${GITHUB_REPO:-innovationtreehouse/infra.cache}"
 # Immutable numeric id of REPO. A rename leaves the old name redirecting, so a
 # re-registered name could serve someone else's release; the id cannot.
 REPO_ID="${GITHUB_REPO_ID:-1343160243}"
@@ -40,7 +45,6 @@ if [[ -z "$TOKEN" && -r /etc/facility-cache/github-token ]]; then
 fi
 export BOOTSTRAP_TOKEN="$TOKEN"
 
-API="https://api.github.com/repos/${REPO}/releases/latest"
 AUTH=()
 if [[ -n "$TOKEN" ]]; then
   AUTH=(-H "Authorization: Bearer ${TOKEN}")
@@ -62,7 +66,12 @@ if [[ "$ACTUAL_ID" != "$REPO_ID" ]]; then
   fail "repo id ${ACTUAL_ID} does not match pinned ${REPO_ID} — the name may have been re-registered; refusing to install"
   exit 1
 fi
-ok "repo id ${REPO_ID}"
+# Only the pinned repository's current name is used from here on: releases
+# and attestations (signed under the post-rename name) are checked against it.
+REPO="$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["full_name"])' "$TMP/repo.json")"
+OWNER_ID="$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["owner"]["id"])' "$TMP/repo.json")"
+ok "repo id ${REPO_ID}  ${REPO}"
+API="https://api.github.com/repos/${REPO}/releases/latest"
 if ! curl -fsSL "${AUTH[@]}" -H "User-Agent: facility-cache-client-bootstrap" \
   -H "Accept: application/vnd.github+json" \
   "$API" >"$TMP/release.json"; then
@@ -180,7 +189,83 @@ PY
 
 NAME="$(cat "$TMP/asset-name")"
 VER="$(cat "$TMP/version" 2>/dev/null || true)"
-ok "verified ${NAME}${VER:+  v$VER}"
+ok "sha256 ${NAME}${VER:+  v$VER}"
+
+# gh for the attestation check. Never from the tarball (unverified code, and it
+# could plant a fake gh): straight from GitHub's apt repo over HTTPS. The
+# keyring here is trusted on TLS to cli.github.com, like GitHub's own install
+# instructions; install.sh then re-checks it against the pinned fingerprints.
+bootstrap_gh() {
+  local kr=/etc/apt/keyrings/facility-cache-githubcli.gpg
+  local list=/etc/apt/sources.list.d/facility-cache-github-cli.list
+  command -v apt-get >/dev/null 2>&1 || return 1
+  install -d -m 0755 /etc/apt/keyrings
+  curl -fsSL --proto '=https' --proto-redir '=https' --max-time 30 \
+    https://cli.github.com/packages/githubcli-archive-keyring.gpg -o "$TMP/gh.gpg" || return 1
+  install -m 0644 "$TMP/gh.gpg" "$kr"
+  printf '# facility-cache-managed — do not edit; facility-cache-apply rewrites the URL.\ndeb [arch=%s signed-by=%s] https://cli.github.com/packages stable main\n' \
+    "$(dpkg --print-architecture)" "$kr" >"$list"
+  export DEBIAN_FRONTEND=noninteractive
+  apt-get update >/dev/null 2>&1 || true
+  apt-get install -y gh >/dev/null 2>&1 || return 1
+  hash -r
+  command -v gh >/dev/null 2>&1
+}
+if ! command -v gh >/dev/null 2>&1; then
+  say "${CYN}●${RST} ${BOLD}gh${RST}  ${DIM}GitHub CLI${RST}"
+  if bootstrap_gh; then
+    ok "$(gh --version 2>/dev/null | head -n1 | tr -d '\r' || echo gh)"
+  fi
+fi
+
+# The bare `gh attestation verify --repo` form needs `gh auth login` even
+# for a public repo, which a fresh install never has. The python3 step above
+# already fetched the Sigstore bundle(s) from the PUBLIC (no-auth)
+# attestations API and wrote them as $TMP/bundle.jsonl, so verify offline
+# with --bundle instead — that genuinely needs no login. gh does the
+# cryptography, org, tag ref and runner checks; the python below requires the
+# certificate's numeric repo and owner ids (never names, so a rename cannot
+# break or fake it) and release.yml of that repo at that tag as the signer.
+# Same rule as attestation_policy_failure in facility-cache-update; duplicated
+# because the updater is in the tarball under test. Any missing field fails.
+bootstrap_attest() {
+  [[ -s "$TMP/bundle.jsonl" && -n "$VER" ]] || return 1
+  gh attestation verify "$TMP/$NAME" \
+    --owner "${REPO%%/*}" \
+    --bundle "$TMP/bundle.jsonl" \
+    --source-ref "refs/tags/v${VER}" \
+    --deny-self-hosted-runners \
+    --format json >"$TMP/verify.json" 2>"$TMP/verify.err" || {
+    tail -n1 "$TMP/verify.err" >&2
+    return 1
+  }
+  python3 - "$TMP/verify.json" "$REPO_ID" "$OWNER_ID" "refs/tags/v${VER}" <<'PY'
+import json, sys
+results, repo_id, owner_id, ref = json.load(open(sys.argv[1])), *sys.argv[2:]
+for res in results if isinstance(results, list) else []:
+    try:
+        c = res["verificationResult"]["signature"]["certificate"]
+        src = c["sourceRepositoryURI"]
+        got = [c["sourceRepositoryIdentifier"], c["sourceRepositoryOwnerIdentifier"],
+               c["sourceRepositoryRef"], c["buildSignerURI"], c["runnerEnvironment"]]
+    except (KeyError, TypeError):
+        continue
+    want = [repo_id, owner_id, ref, f"{src}/.github/workflows/release.yml@{ref}", "github-hosted"]
+    if owner_id and [str(g) for g in got] == want and src.startswith("https://github.com/"):
+        sys.exit(0)
+sys.exit("certificate repo id / owner id / signer / ref do not match")
+PY
+}
+if command -v gh >/dev/null 2>&1; then
+  if bootstrap_attest; then
+    ok "attested  ${NAME}  repo id ${REPO_ID}, refs/tags/v${VER}"
+  else
+    fail "attestation missing or invalid for ${NAME} — refusing to install"
+    exit 1
+  fi
+else
+  fail "WARNING: gh unavailable — attestation NOT verified, installing on sha256 only"
+fi
 
 tar -xzf "$TMP/$NAME" -C "$TMP"
 INSTALLER="$(find "$TMP" -path '*/linux/install.sh' -print | head -n1)"
@@ -189,37 +274,6 @@ if [[ -z "$INSTALLER" ]]; then
   exit 1
 fi
 ok "extracted"
-
-LINUX_DIR="$(dirname "$INSTALLER")"
-if [[ -r "$LINUX_DIR/lib/common.sh" && -r "$LINUX_DIR/lib/ensure_gh.sh" ]]; then
-  # shellcheck disable=SC1091
-  source "$LINUX_DIR/lib/common.sh"
-  # shellcheck disable=SC1091
-  source "$LINUX_DIR/lib/ensure_gh.sh"
-  say "${CYN}●${RST} ${BOLD}gh${RST}  ${DIM}GitHub CLI${RST}"
-  if github_cli_ensure; then
-    ok "$(gh --version 2>/dev/null | head -n1 | tr -d '\r' || echo gh)"
-  else
-    say "${DIM}gh not installed — continuing on sha256 only${RST}"
-  fi
-fi
-
-# The bare `gh attestation verify --repo` form needs `gh auth login` even
-# for a public repo, which a fresh install never has. The python3 step above
-# already fetched the Sigstore bundle(s) from the PUBLIC (no-auth)
-# attestations API and wrote them as $TMP/bundle.jsonl, so verify offline
-# with --bundle instead — that genuinely needs no login.
-if command -v gh >/dev/null 2>&1; then
-  if [[ -s "$TMP/bundle.jsonl" ]] && gh attestation verify "$TMP/$NAME" \
-    --repo "$REPO" \
-    --bundle "$TMP/bundle.jsonl" \
-    --signer-workflow "${REPO}/.github/workflows/release.yml" \
-    --deny-self-hosted-runners >/dev/null 2>&1; then
-    ok "attested  ${NAME}"
-  else
-    say "${DIM}attestation unavailable — continuing on sha256 only${RST}"
-  fi
-fi
 
 ok "running installer"
 bash "$INSTALLER"

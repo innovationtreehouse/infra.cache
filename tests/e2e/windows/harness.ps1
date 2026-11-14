@@ -15,6 +15,15 @@ function Check([string]$name, [bool]$cond, [string]$detail = '') {
 }
 function Section($t) { Write-Host ''; Write-Host "##### $t" }
 function Get-MachineEnvVar([string]$n) { [Environment]::GetEnvironmentVariable($n, 'Machine') }
+function Get-UserEnvVar([string]$n) { [Environment]::GetEnvironmentVariable($n, 'User') }
+$fcDir = Join-Path $env:ProgramData 'FacilityCache'
+# Any allow ACE granting write/delete/ACL rights to someone other than SYSTEM/Administrators.
+function Get-NonAdminWriters([string]$p) {
+    $w = [Security.AccessControl.FileSystemRights]'WriteData, AppendData, WriteExtendedAttributes, WriteAttributes, Delete, DeleteSubdirectoriesAndFiles, ChangePermissions, TakeOwnership'
+    @((Get-Acl -LiteralPath $p).GetAccessRules($true, $true, [Security.Principal.SecurityIdentifier]) | Where-Object {
+        $_.AccessControlType -eq 'Allow' -and @('S-1-5-18', 'S-1-5-32-544') -notcontains $_.IdentityReference.Value -and ($_.FileSystemRights -band $w)
+    } | ForEach-Object { "$p $($_.IdentityReference.Value) $($_.FileSystemRights)" })
+}
 function Write-FcConfig($extra) {
     $cfg = @{ CacheHost = $CacheHost; ExpectedIp = $ExpectedIp }
     if ($extra) { foreach ($k in $extra.Keys) { $cfg[$k] = $extra[$k] } }
@@ -42,6 +51,13 @@ foreach ($f in 'FacilityCache.psm1', 'FacilityCache-Apply.ps1', 'FacilityCache-U
 }
 Check 'task FacilityCache-Apply registered' ([bool](Get-ScheduledTask -TaskName 'FacilityCache-Apply' -ErrorAction SilentlyContinue))
 Check 'task FacilityCache-Update registered' ([bool](Get-ScheduledTask -TaskName 'FacilityCache-Update' -ErrorAction SilentlyContinue))
+$fcAcl = Get-Acl -LiteralPath $fcDir
+Check 'install dir owner is Administrators' ($fcAcl.GetOwner([Security.Principal.SecurityIdentifier]).Value -eq 'S-1-5-32-544') $fcAcl.Owner
+Check 'install dir ACL protected (not inherited from ProgramData)' $fcAcl.AreAccessRulesProtected
+$writers = @(@($fcDir) + @(Get-ChildItem -LiteralPath $fcDir -Recurse -Force | ForEach-Object FullName) | ForEach-Object { Get-NonAdminWriters $_ })
+Check 'non-admins cannot write anything in the install dir' ($writers.Count -eq 0) ($writers -join '; ')
+$exe = Get-ScheduledTask -TaskName 'FacilityCache-Apply' -ErrorAction SilentlyContinue | ForEach-Object { $_.Actions[0].Execute }
+Check 'task runs powershell.exe by absolute path' ($exe -eq (Join-Path $env:SystemRoot 'System32\WindowsPowerShell\v1.0\powershell.exe')) $exe
 $do = Get-ItemProperty 'HKLM:\SOFTWARE\Policies\Microsoft\Windows\DeliveryOptimization' -ErrorAction SilentlyContinue
 Check 'DO: DOCacheHostSource=2, no static host' ($do.DOCacheHostSource -eq 2 -and -not $do.DOCacheHost)
 Check 'machine env PIP_INDEX_URL set' ((Get-MachineEnvVar 'PIP_INDEX_URL') -eq "http://${CacheHost}:3141/root/pypi/+simple/") (Get-MachineEnvVar 'PIP_INDEX_URL')
@@ -103,61 +119,93 @@ Check 'repo-id pin mismatch refuses (nonzero exit)' ($LASTEXITCODE -ne 0)
 Write-FcConfig $null
 & powershell.exe -NoProfile -ExecutionPolicy Bypass -Command "Import-Module '$env:ProgramData\FacilityCache\FacilityCache.psm1'; Update-FacilityCacheClient" | Tee-Object -Variable upd | Out-Host
 $updExit = $LASTEXITCODE
-Check 'attestation verified during update' ([bool]($upd -match 'verified'))
 $state = Get-Content (Join-Path $env:ProgramData 'FacilityCache\state.json') -Raw | ConvertFrom-Json
 $v = (Get-Content (Join-Path $env:ProgramData 'FacilityCache\VERSION') -Raw).Trim()
-# The update installs the LATEST published release. Releases up to v1.0.1 ship
-# an installer with the daemon.json PS 5.1 crash, so until a newer release is
-# published the honest outcome is a surfaced failure. Accept either: a clean
-# update (state=updated, VERSION advanced) or a truthfully recorded failure.
-if ($state.last_result -eq 'updated') {
-    Check 'full update: clean (state=updated, VERSION advanced)' ($updExit -eq 0 -and $v -ne '1.0.0') "now $v"
-} else {
-    # No VERSION assertion here: the released installer copies files (VERSION
-    # included) before the step it crashes on, so a failed install can still
-    # advance the VERSION file. What matters is that the failure is surfaced.
-    Check 'full update: released-installer failure surfaced honestly (pre-fix release)' ($updExit -ne 0 -and $state.last_result -like 'update failed:*') $state.last_result
-}
+# The latest release (v1.0.3 at the time of writing) was built before the repo
+# rename: its certificate names innovationtreehouse/cache. The check is by
+# repo/owner id + release.yml at refs/tags/v<version>, so it must still verify.
+Check 'full update: clean (state=updated, VERSION advanced)' ($updExit -eq 0 -and $state.last_result -eq 'updated' -and $v -ne '1.0.0') "exit=$updExit result=$($state.last_result) now $v"
+Check 'attestation verified by repo id during update' ($state.attestation -eq 'verified' -and [bool]($upd -match 'verified')) "attestation=$($state.attestation)"
 Check 'update re-registered tasks' ([bool](Get-ScheduledTask -TaskName 'FacilityCache-Apply' -ErrorAction SilentlyContinue))
 
-Section 'T7 shared machine: gh session dir, env, reset task, shim'
+Section 'T7 install-dir hardening + shared machine: per-user gh session, env, reset task, shim'
+# Plant what a non-admin could have left in an unhardened install dir.
+$planted = Join-Path $fcDir 'planted.ps1'
+'# planted' | Set-Content -LiteralPath $planted -Encoding ASCII
+& icacls.exe $planted /setowner '*S-1-5-32-545' | Out-Null
+$plantedOwned = ($LASTEXITCODE -eq 0)
+$junkTarget = 'C:\fc-e2e-junk-target'
+New-Item -ItemType Directory -Force -Path $junkTarget | Out-Null
+'keep' | Set-Content -LiteralPath (Join-Path $junkTarget 'keep.txt') -Encoding ASCII
+New-Item -ItemType Junction -Path (Join-Path $fcDir 'junk-link') -Target $junkTarget | Out-Null
+'not-a-real-token' | Set-Content -LiteralPath (Join-Path $fcDir 'github-token') -Encoding ASCII
+# The pre-per-user machine-wide session dir and its machine-scope env.
+$oldSess = Join-Path $fcDir 'gh-session'
+New-Item -ItemType Directory -Force -Path (Join-Path $oldSess 'gh') | Out-Null
+[Environment]::SetEnvironmentVariable('GH_CONFIG_DIR', (Join-Path $oldSess 'gh'), 'Machine')
+[Environment]::SetEnvironmentVariable('GIT_CONFIG_GLOBAL', (Join-Path $oldSess 'gitconfig'), 'Machine')
 # T6 installed the latest RELEASE; reinstall this tree so the feature under test is present.
 & powershell.exe -NoProfile -ExecutionPolicy Bypass -File (Join-Path $RepoRoot 'windows\Install-FacilityCache.ps1') -NoRestartDocker -NoDocker
 Check 'reinstall from tree exit 0' ($LASTEXITCODE -eq 0) "exit=$LASTEXITCODE"
-$apply = Join-Path $env:ProgramData 'FacilityCache\FacilityCache-Apply.ps1'
-$sess = Join-Path $env:ProgramData 'FacilityCache\gh-session'
-$include = (Join-Path $env:ProgramData 'FacilityCache\shared.gitconfig').Replace('\', '/')
-Check 'installed: Treehouse-Git.ps1, shared.gitconfig' ((Test-Path (Join-Path $env:ProgramData 'FacilityCache\Treehouse-Git.ps1')) -and (Test-Path (Join-Path $env:ProgramData 'FacilityCache\shared.gitconfig')))
+if ($plantedOwned) { Check 'file owned by a non-admin removed from install dir' (-not (Test-Path -LiteralPath $planted)) } else { Write-Host 'SKIP  could not set a non-admin owner on the planted file' }
+Check 'planted junction removed, its target untouched' (-not (Test-Path -LiteralPath (Join-Path $fcDir 'junk-link')) -and (Test-Path -LiteralPath (Join-Path $junkTarget 'keep.txt')))
+$tokAcl = Get-Acl -LiteralPath (Join-Path $fcDir 'github-token')
+$tokOther = @($tokAcl.GetAccessRules($true, $true, [Security.Principal.SecurityIdentifier]) | Where-Object { @('S-1-5-18', 'S-1-5-32-544') -notcontains $_.IdentityReference.Value })
+Check 'github-token readable by SYSTEM/Administrators only' ($tokAcl.AreAccessRulesProtected -and $tokOther.Count -eq 0)
+Remove-Item -LiteralPath (Join-Path $fcDir 'github-token') -Force
+Check 'old in-tree gh-session removed' (-not (Test-Path -LiteralPath $oldSess))
+Check 'stale machine-scope GH_CONFIG_DIR / GIT_CONFIG_GLOBAL cleared' (-not (Get-MachineEnvVar 'GH_CONFIG_DIR') -and -not (Get-MachineEnvVar 'GIT_CONFIG_GLOBAL'))
+$apply = Join-Path $fcDir 'FacilityCache-Apply.ps1'
+$sess = Join-Path $env:USERPROFILE 'AppData\Local\FacilityCache\gh-session'
+$include = (Join-Path $fcDir 'shared.gitconfig').Replace('\', '/')
+Check 'installed: Treehouse-Git.ps1, shared.gitconfig' ((Test-Path (Join-Path $fcDir 'Treehouse-Git.ps1')) -and (Test-Path (Join-Path $fcDir 'shared.gitconfig')))
 Check 'task FacilityCache-SessionReset registered' ([bool](Get-ScheduledTask -TaskName 'FacilityCache-SessionReset' -ErrorAction SilentlyContinue))
-Check 'shim treehouse-git.cmd in SystemRoot' (Test-Path (Join-Path $env:SystemRoot 'treehouse-git.cmd'))
-Check 'not shared by default: no machine GH_CONFIG_DIR' (-not (Get-MachineEnvVar 'GH_CONFIG_DIR'))
+$shim = Join-Path $env:SystemRoot 'treehouse-git.cmd'
+Check 'shim treehouse-git.cmd in SystemRoot' (Test-Path $shim)
+Check 'shim runs powershell.exe by absolute path' ([bool]((Get-Content -LiteralPath $shim -Raw) -match '"%SystemRoot%\\System32\\WindowsPowerShell\\v1\.0\\powershell\.exe"'))
+Check 'not shared by default: no user GH_CONFIG_DIR' (-not (Get-UserEnvVar 'GH_CONFIG_DIR'))
 Write-FcConfig @{ SharedMachine = $true }
 & powershell.exe -NoProfile -ExecutionPolicy Bypass -File $apply
 Check 'apply (shared) exit 0' ($LASTEXITCODE -eq 0)
-Check 'session dir created' (Test-Path -LiteralPath $sess -PathType Container)
-$usersM = @((Get-Acl -LiteralPath $sess).GetAccessRules($true, $false, [Security.Principal.SecurityIdentifier]) | Where-Object {
-    $_.IdentityReference.Value -eq 'S-1-5-32-545' -and ($_.FileSystemRights -band [Security.AccessControl.FileSystemRights]::Modify) -eq [Security.AccessControl.FileSystemRights]::Modify
-})
-Check 'session dir grants BUILTIN\Users modify' ($usersM.Count -gt 0)
-Check 'machine env GH_CONFIG_DIR set' ((Get-MachineEnvVar 'GH_CONFIG_DIR') -eq (Join-Path $sess 'gh')) (Get-MachineEnvVar 'GH_CONFIG_DIR')
-Check 'machine env GIT_CONFIG_GLOBAL set' ((Get-MachineEnvVar 'GIT_CONFIG_GLOBAL') -eq (Join-Path $sess 'gitconfig'))
+Check 'never machine scope: no machine GH_CONFIG_DIR / GIT_CONFIG_GLOBAL' (-not (Get-MachineEnvVar 'GH_CONFIG_DIR') -and -not (Get-MachineEnvVar 'GIT_CONFIG_GLOBAL'))
+Check 'user env GH_CONFIG_DIR -> own profile' ((Get-UserEnvVar 'GH_CONFIG_DIR') -eq (Join-Path $sess 'gh')) (Get-UserEnvVar 'GH_CONFIG_DIR')
+Check 'user env GIT_CONFIG_GLOBAL -> own profile' ((Get-UserEnvVar 'GIT_CONFIG_GLOBAL') -eq (Join-Path $sess 'gitconfig')) (Get-UserEnvVar 'GIT_CONFIG_GLOBAL')
 if (Get-Command git -ErrorAction SilentlyContinue) {
     Check 'git system include added' (@(& git config --system --get-all include.path) -contains $include)
 }
 New-Item -ItemType Directory -Force -Path (Join-Path $sess 'gh') | Out-Null
 # Deliberately NOT token-shaped, so the reset posts nothing to GitHub.
 "github.com:`n    user: e2e`n    oauth_token: not-a-real-token" | Set-Content (Join-Path $sess 'gh\hosts.yml') -Encoding ASCII
+'[alias]' | Set-Content (Join-Path $sess 'gitconfig') -Encoding ASCII
 '1' | Set-Content (Join-Path $sess 'expires') -Encoding ASCII
 & powershell.exe -NoProfile -ExecutionPolicy Bypass -File $apply
 Check 'apply (expired session) exit 0' ($LASTEXITCODE -eq 0)
-Check 'expired session contents wiped, dir kept' ((Test-Path -LiteralPath $sess) -and @(Get-ChildItem -LiteralPath $sess -Force).Count -eq 0)
+Check 'expired session dir removed' (-not (Test-Path -LiteralPath $sess))
+New-Item -ItemType Directory -Force -Path $sess | Out-Null
+([DateTimeOffset]::UtcNow.ToUnixTimeSeconds() + 3600) | Set-Content (Join-Path $sess 'expires') -Encoding ASCII
+& powershell.exe -NoProfile -ExecutionPolicy Bypass -File $apply
+Check 'live session kept by apply' (Test-Path -LiteralPath (Join-Path $sess 'expires'))
+& powershell.exe -NoProfile -ExecutionPolicy Bypass -Command "Import-Module '$fcDir\FacilityCache.psm1'; if (-not (Reset-TreehouseGitSession)) { exit 1 }"
+Check 'reset (logon/logoff/startup task command) exit 0, session removed' ($LASTEXITCODE -eq 0 -and -not (Test-Path -LiteralPath $sess))
+# A member-planted junction inside the session must be removed, never followed.
+$ghTarget = 'C:\fc-e2e-gh-target'
+New-Item -ItemType Directory -Force -Path $ghTarget | Out-Null
+'oauth_token: not-a-real-token' | Set-Content (Join-Path $ghTarget 'hosts.yml') -Encoding ASCII
+New-Item -ItemType Directory -Force -Path $sess | Out-Null
+New-Item -ItemType Junction -Path (Join-Path $sess 'gh') -Target $ghTarget | Out-Null
+'1' | Set-Content (Join-Path $sess 'expires') -Encoding ASCII
+& powershell.exe -NoProfile -ExecutionPolicy Bypass -File $apply
+Check 'session with planted gh junction removed, junction target untouched' (-not (Test-Path -LiteralPath $sess) -and (Test-Path -LiteralPath (Join-Path $ghTarget 'hosts.yml')))
 Write-FcConfig $null
 & powershell.exe -NoProfile -ExecutionPolicy Bypass -File $apply
 Check 'apply (not shared) exit 0' ($LASTEXITCODE -eq 0)
-Check 'machine env GH_CONFIG_DIR / GIT_CONFIG_GLOBAL cleared' (-not (Get-MachineEnvVar 'GH_CONFIG_DIR') -and -not (Get-MachineEnvVar 'GIT_CONFIG_GLOBAL'))
+Check 'user env GH_CONFIG_DIR / GIT_CONFIG_GLOBAL cleared' (-not (Get-UserEnvVar 'GH_CONFIG_DIR') -and -not (Get-UserEnvVar 'GIT_CONFIG_GLOBAL'))
 if (Get-Command git -ErrorAction SilentlyContinue) {
     Check 'git system include removed' (@(& git config --system --get-all include.path) -notcontains $include)
 }
+Write-FcConfig @{ SharedMachine = $true }
+& powershell.exe -NoProfile -ExecutionPolicy Bypass -File $apply
+New-Item -ItemType Directory -Force -Path $sess | Out-Null
 
 Section 'T8 uninstall'
 & powershell.exe -NoProfile -ExecutionPolicy Bypass -File (Join-Path $env:ProgramData 'FacilityCache\Uninstall-FacilityCache.ps1')
@@ -168,6 +216,8 @@ Check 'DO policy removed' (-not $do2 -or -not $do2.PSObject.Properties['DOCacheH
 Check 'machine env cleared' (-not (Get-MachineEnvVar 'PIP_INDEX_URL') -and -not (Get-MachineEnvVar 'NPM_CONFIG_REGISTRY'))
 Check 'task FacilityCache-SessionReset unregistered' (-not (Get-ScheduledTask -TaskName 'FacilityCache-SessionReset' -ErrorAction SilentlyContinue))
 Check 'shim treehouse-git.cmd removed' (-not (Test-Path (Join-Path $env:SystemRoot 'treehouse-git.cmd')))
+Check 'uninstall: user env GH_CONFIG_DIR / GIT_CONFIG_GLOBAL removed' (-not (Get-UserEnvVar 'GH_CONFIG_DIR') -and -not (Get-UserEnvVar 'GIT_CONFIG_GLOBAL'))
+Check 'uninstall: gh session removed' (-not (Test-Path -LiteralPath $sess))
 Check 'module removed' (-not (Test-Path (Join-Path $env:ProgramData 'FacilityCache\FacilityCache.psm1')))
 Check 'config.json kept' (Test-Path (Join-Path $env:ProgramData 'FacilityCache\config.json'))
 Check 'logs kept' (Test-Path (Join-Path $env:ProgramData 'FacilityCache\logs'))

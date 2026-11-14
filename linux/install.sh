@@ -71,9 +71,11 @@ if [[ ! -f /etc/facility-cache/config ]]; then
   cat >/etc/facility-cache/config <<'EOF'
 # Local overrides. Package defaults are in /usr/local/lib/facility-cache/defaults
 # and are replaced on each GitHub Release.
+# This file is world-readable: never put GITHUB_TOKEN here. A token goes in
+# /etc/facility-cache/github-token (root-only, mode 600).
 #
 # EXPECTED_IP=10.41.1.50
-# GITHUB_REPO=innovationtreehouse/cache
+# GITHUB_REPO=innovationtreehouse/infra.cache
 # AUTO_UPDATE=1
 # SHARED_MACHINE=1
 # GH_SESSION_HOURS=36
@@ -82,6 +84,13 @@ EOF
   ui_step_ok "wrote /etc/facility-cache/config"
 else
   ui_step_ok "kept existing /etc/facility-cache/config"
+fi
+if grep -q '^[[:space:]]*GITHUB_TOKEN=' /etc/facility-cache/config &&
+  [[ "$(stat -c %a /etc/facility-cache/config)" =~ [4-7]$ ]]; then
+  ui_warn "GITHUB_TOKEN is in world-readable /etc/facility-cache/config — move it to /etc/facility-cache/github-token (mode 600) and revoke it"
+fi
+if [[ -f /etc/facility-cache/github-token ]]; then
+  chmod 600 /etc/facility-cache/github-token
 fi
 
 ui_step "files" "binaries, defaults, UI"
@@ -137,7 +146,7 @@ fi
 if declare -F github_cli_ensure >/dev/null 2>&1 && github_cli_ensure; then
   ui_step_ok "$(gh --version 2>/dev/null | head -n1 | tr -d '\r' || echo gh)"
 else
-  ui_step_skip "not installed — attestations stay warn-only"
+  ui_step_skip "not installed — updates will install on sha256 only, attestation NOT verified"
 fi
 
 ui_step "hooks" "NetworkManager + systemd"
