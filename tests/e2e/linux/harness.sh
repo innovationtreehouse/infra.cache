@@ -209,6 +209,10 @@ facility-cache log --json >/dev/null 2>&1
 ck "facility-cache log --json" $?
 
 sec "T11 uninstall"
+# T10 installed the latest RELEASE, including its uninstaller; reinstall this
+# tree so T11 exercises the uninstaller under test.
+bash /opt/src/linux/install.sh >/dev/null 2>&1
+ck "reinstall from tree exit 0" $?
 facility-cache uninstall
 ck "uninstall exit 0" $?
 [ ! -e /usr/local/sbin/facility-cache-apply ] && [ ! -e /usr/local/bin/facility-cache ] && [ ! -d /usr/local/lib/facility-cache ]
