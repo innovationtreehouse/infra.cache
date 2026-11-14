@@ -197,6 +197,7 @@ New-Item -ItemType Directory -Force -Path $sess | Out-Null
 Check 'live session kept by apply' (Test-Path -LiteralPath (Join-Path $sess 'expires'))
 & powershell.exe -NoProfile -ExecutionPolicy Bypass -Command "Import-Module '$fcDir\FacilityCache.psm1'; if (-not (Reset-TreehouseGitSession)) { exit 1 }"
 Check 'reset (logon/logoff/startup task command) exit 0, session removed' ($LASTEXITCODE -eq 0 -and -not (Test-Path -LiteralPath $sess))
+Check 'sessions are only deleted, never revoked on GitHub (no revoke call in the module)' (-not (Select-String -LiteralPath (Join-Path $fcDir 'FacilityCache.psm1') -SimpleMatch 'api.github.com/credentials' -Quiet))
 # A member-planted junction inside the session must be removed, never followed.
 $ghTarget = 'C:\fc-e2e-gh-target'
 New-Item -ItemType Directory -Force -Path $ghTarget | Out-Null

@@ -66,9 +66,9 @@ Then use git normally. HTTPS and SSH-style GitHub remotes both work.
 
 | Event | Signed out? |
 |---|---|
-| OS logout or reboot | Yes (Windows also revokes the token on GitHub) |
-| `treehouse-git signout` | Yes (token revoked on GitHub) |
-| 36 hours after sign-in | Yes (token revoked on GitHub) |
+| OS logout or reboot | Yes |
+| `treehouse-git signout` | Yes |
+| 36 hours after sign-in | Yes |
 | Screen lock / idle | **No** |
 
 Because screen lock does not sign you out, run `treehouse-git signout`
@@ -129,7 +129,18 @@ before walking away.
 - A repository that has its own `user.email` set locally overrides your
   identity. `treehouse-git status` warns about this. Fix it with
   `git config --local --unset user.email`.
-- On Linux, logout wipes the token but does not revoke it on GitHub. Signout
-  and the 36-hour limit do revoke it.
+- **Signing out does not revoke the token on GitHub.** Signout, logout,
+  reboot and the 36-hour limit all delete the token from the computer. The
+  token itself stays valid on GitHub.
+  - Why: on 2026-11-14, revoking one session token through GitHub's
+    credential-revocation API also signed the same person out of `gh` on
+    their other computers. Every GitHub CLI login of that user stopped
+    working within seconds.
+  - If you think someone copied your session token, revoke **GitHub CLI** at
+    https://github.com/settings/applications (Authorized OAuth Apps). That
+    signs `gh` out on all your devices.
+  - Planned fix: a dedicated Innovation Treehouse GitHub App for this
+    sign-in. Its user tokens expire on their own after a few hours, and
+    revoking them would not touch your own `gh` logins.
 - Anyone at the keyboard while you are signed in can act as you. Sign out
   when you leave.

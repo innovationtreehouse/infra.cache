@@ -72,8 +72,7 @@ check sweep-keeps-live-session 0 "$([[ -d "$S" ]] && echo 0 || echo 1)"
 echo $(($(date +%s) - 10)) >"$S/expires"
 "$TG" sweep
 check sweep-removes-expired 0 "$([[ ! -e "$S" ]] && echo 0 || echo 1)"
-grep -q gho_faketoken123 "$CURL_LOG"
-check sweep-revokes-token 0 $?
+check sweep-never-revokes 0 "$([[ ! -s "$CURL_LOG" ]] && echo 0 || echo 1)"
 "$TG" status >/dev/null 2>&1
 check status-signed-out 1 $?
 
@@ -89,8 +88,7 @@ check non-token-never-sent 0 "$([[ ! -s "$CURL_LOG" ]] && echo 0 || echo 1)"
 fake_session "$(($(date +%s) + 3600))" "oauth_token: gho_faketoken123"
 "$TG" signout >/dev/null 2>&1
 check signout-removes 0 "$([[ ! -e "$S" ]] && echo 0 || echo 1)"
-grep -q gho_faketoken123 "$CURL_LOG"
-check signout-revokes 0 $?
+check signout-never-revokes 0 "$([[ ! -s "$CURL_LOG" ]] && echo 0 || echo 1)"
 
 # Links inside the session are user-controlled: never followed, session still wiped.
 printf 'github.com:\n  oauth_token: gho_elsewhere456\n' >"$TMP/elsewhere.yml"

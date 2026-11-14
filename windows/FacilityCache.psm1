@@ -160,7 +160,7 @@ function Protect-FacilityCacheInstallDir {
     }
     if (-not $item) { [void][IO.Directory]::CreateDirectory($dir) }
     Set-FcAcl -Path $dir -Protect
-    # The pre-hardening shared-machine session dir is handled (token revoked) below.
+    # The pre-hardening shared-machine session dir is handled (deleted) below.
     Protect-FcTree -Dir $dir -Trusted $trusted -Notes $notes -Skip @('gh-session')
     [void](Remove-TreehouseGitSessionDir -Base $dir -Rel 'gh-session')
     return $notes.ToArray()
@@ -264,7 +264,9 @@ function Write-FacilityCacheLog {
     }
     try {
         $path = Get-FacilityCacheLogPath
-        ($rec | ConvertTo-Json -Compress -Depth 6) | Add-Content -LiteralPath $path -Encoding UTF8
+        # -ErrorAction Stop so the catch below sees it: members (treehouse-git) cannot
+        # write the admin-only log, and must not get an error printed for that.
+        ($rec | ConvertTo-Json -Compress -Depth 6) | Add-Content -LiteralPath $path -Encoding UTF8 -ErrorAction Stop
         if ((Get-Item $path).Length -gt 2000000) {
             $bak = "$path.1"
             if (Test-Path $bak) { Remove-Item $bak -Force }
@@ -793,22 +795,8 @@ function Get-TreehouseGitSessionExpiry {
     return $exp
 }
 
-function Get-FcSessionToken {
-    # Token-shaped strings from <session>\gh\hosts.yml. Member-writable, read by
-    # SYSTEM: refuse a link or non-regular file at every component.
-    param([string]$Dir)
-    $gh = Get-Item -LiteralPath (Join-Path $Dir 'gh') -Force -ErrorAction SilentlyContinue
-    if (-not $gh -or -not $gh.PSIsContainer -or (Test-FcLink $gh)) { return @() }
-    $hosts = Get-Item -LiteralPath (Join-Path $gh.FullName 'hosts.yml') -Force -ErrorAction SilentlyContinue
-    if (-not $hosts -or $hosts.PSIsContainer -or (Test-FcLink $hosts)) { return @() }
-    return @(Get-Content -LiteralPath $hosts.FullName -ErrorAction SilentlyContinue | ForEach-Object {
-        if ($_ -cmatch '^\s*oauth_token:\s*(gh[a-z]_[A-Za-z0-9_]+)\s*$') { $Matches[1] }
-    } | Select-Object -Unique)
-}
-
 function Remove-TreehouseGitSessionDir {
-    # Revokes the session's gh token on GitHub, then deletes the whole session dir
-    # $Base\$Rel. Walks down from the trusted $Base so SYSTEM never follows a
+    # Deletes the whole session dir $Base\$Rel. Walks down from the trusted $Base so SYSTEM never follows a
     # link a member planted on the way. $true when the dir is gone afterwards.
     param([string]$Base, [string]$Rel, [switch]$OnlyIfExpired)
     $d = $Base
@@ -825,21 +813,8 @@ function Remove-TreehouseGitSessionDir {
         }
     }
     if ($OnlyIfExpired -and [DateTimeOffset]::UtcNow.ToUnixTimeSeconds() -lt (Get-TreehouseGitSessionExpiry -Dir $d)) { return $true }
-    $tokens = @(Get-FcSessionToken -Dir $d)
-    if ($tokens.Count -gt 0) {
-        try {
-            [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
-            # Built by hand: the regex limits tokens to [A-Za-z0-9_], and this stays an
-            # array for one token on every PowerShell version.
-            $body = '{"credentials":["' + ($tokens -join '","') + '"]}'
-            # Must be unauthenticated: GitHub answers 403 to any Authorization header.
-            Invoke-RestMethod -Method Post -Uri 'https://api.github.com/credentials/revoke' -Body $body `
-                -ContentType 'application/json' -TimeoutSec 10 `
-                -Headers @{ Accept = 'application/vnd.github+json'; 'User-Agent' = 'facility-cache-client' } | Out-Null
-        } catch {
-            Write-FcWarn "could not revoke the GitHub token: $($_.Exception.Message)"
-        }
-    }
+    # Deleted, never revoked on GitHub: POST /credentials/revoke on one GitHub CLI
+    # token was observed to invalidate ALL of that user's GitHub CLI logins.
     # .NET's recursive delete removes junctions/symlinks inside without following
     # them; PS 5.1's Remove-Item -Recurse does follow them, so do not use it here.
     try {
