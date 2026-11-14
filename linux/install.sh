@@ -115,6 +115,9 @@ fi
 if [[ -f "${ROOT}/shared.gitconfig" ]]; then
   install -m 0644 "${ROOT}/shared.gitconfig" "${STAGE}/lib/shared.gitconfig"
 fi
+if [[ -f "${ROOT}/assets/github-login-device-qr.png" ]]; then
+  install -m 0644 "${ROOT}/assets/github-login-device-qr.png" "${STAGE}/lib/github-login-device-qr.png"
+fi
 # Always record the resolved version (tarball VERSION, git describe, or dev).
 printf '%s\n' "$VER" >"${STAGE}/lib/VERSION"
 chmod 0644 "${STAGE}/lib/VERSION"

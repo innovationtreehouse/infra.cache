@@ -112,7 +112,13 @@ class PackTest(unittest.TestCase):
             members = set(tar.getnames())
         expected = {
             f"{self.prefix}/{rel}"
-            for rel in ["VERSION", "README.md", "defaults.env", "shared.gitconfig"]
+            for rel in [
+                "VERSION",
+                "README.md",
+                "defaults.env",
+                "shared.gitconfig",
+                pack_release.QR_PNG,
+            ]
             + pack_release.LINUX_FILES
         }
         self.assertEqual(members, expected)
@@ -122,10 +128,25 @@ class PackTest(unittest.TestCase):
             members = set(zf.namelist())
         expected = {
             f"{self.prefix}/{rel}"
-            for rel in ["VERSION", "README.md", "defaults.json", "shared.gitconfig"]
+            for rel in [
+                "VERSION",
+                "README.md",
+                "defaults.json",
+                "shared.gitconfig",
+                pack_release.QR_PNG,
+            ]
             + pack_release.WINDOWS_FILES
         }
         self.assertEqual(members, expected)
+
+    def test_qr_png_is_the_verified_one(self):
+        # Decoded with `zbarimg --raw` to exactly https://github.com/login/device
+        # when committed; any change to the image must be re-checked the same way.
+        data = (pack_release.ROOT / pack_release.QR_PNG).read_bytes()
+        self.assertEqual(
+            hashlib.sha256(data).hexdigest(),
+            "7fb53a45a30c13b692059ebfdaf98ed4fd85eab7a70ec7fc40f05d9282dfc7d0",
+        )
 
     def test_bootstrap_shipped_verbatim(self):
         self.assertEqual(
