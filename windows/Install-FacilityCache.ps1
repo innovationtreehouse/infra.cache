@@ -126,6 +126,10 @@ Unregister-ScheduledTask -TaskName $taskName -Confirm:$false -ErrorAction Silent
 $arg = "-NoProfile -WindowStyle Hidden -ExecutionPolicy Bypass -File `"$(Join-Path $dest 'FacilityCache-Apply.ps1')`""
 $action = New-ScheduledTaskAction -Execute $powershell -Argument $arg
 $principal = New-ScheduledTaskPrincipal -UserId 'SYSTEM' -LogonType ServiceAccount -RunLevel Highest
+# Default task settings skip runs on battery: a laptop that leaves the facility
+# unplugged would keep pip/npm pointed at the cache, and a missed session reset
+# would leave a member signed in. StartWhenAvailable catches up a missed daily run.
+$taskSettings = New-ScheduledTaskSettingsSet -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries -StartWhenAvailable
 $repeat = New-ScheduledTaskTrigger -Once -At (Get-Date).AddMinutes(1) `
     -RepetitionInterval (New-TimeSpan -Minutes 5) `
     -RepetitionDuration (New-TimeSpan -Days 3650)
@@ -151,7 +155,7 @@ try {
     Write-Host 'Could not register a network-change trigger; using boot + 5-minute timer only.'
 }
 
-Register-ScheduledTask -TaskName $taskName -Action $action -Trigger $triggers -Principal $principal `
+Register-ScheduledTask -TaskName $taskName -Action $action -Trigger $triggers -Principal $principal -Settings $taskSettings `
     -Description 'Enable Innovation Treehouse cache drop-ins only on the facility LAN' | Out-Null
 
 $updateName = 'FacilityCache-Update'
@@ -167,7 +171,7 @@ $updateTriggers = @(
     (New-ScheduledTaskTrigger -AtStartup),
     $updateDaily
 )
-Register-ScheduledTask -TaskName $updateName -Action $updateAction -Trigger $updateTriggers -Principal $principal `
+Register-ScheduledTask -TaskName $updateName -Action $updateAction -Trigger $updateTriggers -Principal $principal -Settings $taskSettings `
     -Description 'Install newer facility-cache-client GitHub Releases' | Out-Null
 
 # Shared-machine GitHub session wipe (no-op when no session exists). Startup,
@@ -196,12 +200,13 @@ try {
 } catch {
     Write-Host 'Could not register a logoff trigger; session resets at startup, logon and expiry only.'
 }
-# Default task settings skip runs on battery; a missed reset would leave a member signed in.
-$resetSettings = New-ScheduledTaskSettingsSet -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries
 Register-ScheduledTask -TaskName $resetName -Action $resetAction -Trigger $resetTriggers -Principal $principal `
-    -Settings $resetSettings -Description 'Sign shared-machine members out of GitHub at startup, logon and logoff' | Out-Null
+    -Settings $taskSettings -Description 'Sign shared-machine members out of GitHub at startup, logon and logoff' | Out-Null
 Write-FcStepOk 'FacilityCache-Apply 5m · FacilityCache-Update daily · FacilityCache-SessionReset logon/logoff'
 
+if ((Get-FacilityCacheConfig).SharedMachine -eq $true -and -not (Get-FcTrustedCommand git)) {
+    Write-FcWarn 'SharedMachine is on but Git for Windows is not installed machine-wide: treehouse-git signin will refuse and git is not routed through the member sign-in until it is (the next apply picks it up). See docs/SHARED-MACHINES.md.'
+}
 Write-FcFinish -Ok $true -Message "v$ver ready"
 Write-FcNote 'Status-FacilityCache.ps1     dashboard'
 Write-FcNote 'FacilityCache-Update.ps1     GitHub Releases'

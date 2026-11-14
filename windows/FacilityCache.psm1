@@ -946,7 +946,7 @@ function Start-TreehouseGitSession {
     }
     foreach ($tool in @('gh', 'git')) {
         if (-not (Get-Command $tool -ErrorAction SilentlyContinue)) {
-            Write-FcFail "$tool is not installed"
+            Write-FcFail "$tool is not installed on this computer; ask an admin to install it machine-wide (docs/SHARED-MACHINES.md)"
             return $false
         }
     }
@@ -1478,7 +1478,7 @@ Export-ModuleMember -Function @(
     'Update-FacilityCacheClient',
     'Sync-FacilityCacheGitHubCli',
     'Test-FacilityCacheAttestation',
-    'Protect-FacilityCacheInstallDir',
+    'Protect-FacilityCacheInstallDir', 'Get-FcTrustedCommand',
     'Reset-TreehouseGitSession', 'Start-TreehouseGitSession', 'Show-TreehouseGitSession',
     'Disable-TreehouseGitSharedMachine',
     'Write-FcHeader', 'Write-FcKv', 'Write-FcOk', 'Write-FcFail', 'Write-FcWarn',
