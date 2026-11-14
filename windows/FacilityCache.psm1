@@ -9,12 +9,21 @@ $script:DefaultConfig = @{
     DockerHubPort    = 5000
     DockerGhcrPort   = 5001
     ProbeTimeoutMs   = 1000
-    GitHubRepo       = 'innovationtreehouse/cache'
+    # Display only: updates resolve the current name from GitHubRepoId.
+    GitHubRepo       = 'innovationtreehouse/infra.cache'
     GitHubRepoId     = 1343160243
     AutoUpdate       = $true
     SharedMachine    = $false
     GhSessionHours   = 36
 }
+
+# Well-known SIDs: names are localized, SIDs are not.
+$script:SidSystem = 'S-1-5-18'
+$script:SidAdmins = 'S-1-5-32-544'
+$script:SidUsers = 'S-1-5-32-545'
+$script:SidTrustedInstaller = 'S-1-5-80-956008885-3418522649-1831038044-1853292631-2271478464'
+# Per-user, under the member's own profile (see Get-TreehouseGitSessionDir).
+$script:SessionRel = 'AppData\Local\FacilityCache\gh-session'
 
 function Merge-FacilityCacheObject {
     param($Cfg, $Obj)
@@ -26,6 +35,175 @@ function Merge-FacilityCacheObject {
 
 function Get-FacilityCacheInstallDir {
     return (Join-Path $env:ProgramData 'FacilityCache')
+}
+
+function Test-FcElevated {
+    # True for SYSTEM and elevated admins; false for a member's limited token.
+    $id = [Security.Principal.WindowsIdentity]::GetCurrent()
+    return (New-Object Security.Principal.WindowsPrincipal($id)).IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)
+}
+
+function Test-FcLink {
+    param($Item)
+    return [bool]($Item.Attributes -band [IO.FileAttributes]::ReparsePoint)
+}
+
+function Remove-FcLink {
+    # Deletes a junction/symlink itself, never its target.
+    param($Item)
+    if ($Item.PSIsContainer) { [IO.Directory]::Delete($Item.FullName, $false) } else { [IO.File]::Delete($Item.FullName) }
+}
+
+function Get-FcTrustedOwnerSids {
+    # Owners whose files SYSTEM may trust: SYSTEM, Administrators, TrustedInstaller,
+    # the (admin) account running this, and local Administrators members.
+    $s = @($script:SidSystem, $script:SidAdmins, $script:SidTrustedInstaller,
+        [Security.Principal.WindowsIdentity]::GetCurrent().User.Value)
+    try { $s += @(Get-LocalGroupMember -SID $script:SidAdmins -ErrorAction Stop | ForEach-Object { $_.SID.Value }) } catch { }
+    return $s
+}
+
+function Test-FcTrustedOwner {
+    param([string]$Path, [string[]]$Trusted)
+    try {
+        $owner = (Get-Acl -LiteralPath $Path).GetOwner([Security.Principal.SecurityIdentifier]).Value
+    } catch {
+        return $false
+    }
+    return ($Trusted -contains $owner)
+}
+
+function Set-FcAcl {
+    # Owner -> Administrators and drop every explicit ACE. -Protect: then grant
+    # exactly SYSTEM + Administrators full control (+ Users read/execute unless
+    # -NoUsers) with inheritance from the parent cut; otherwise inherit only.
+    # Windows PowerShell 5.1 (.NET Framework instance methods; Set-Acl in 5.1
+    # wrongly tries to write the SACL when the DACL is protected).
+    param([string]$Path, [switch]$Protect, [switch]$NoUsers)
+    $item = Get-Item -LiteralPath $Path -Force
+    $acl = $item.GetAccessControl()
+    $sidType = [Security.Principal.SecurityIdentifier]
+    foreach ($r in @($acl.GetAccessRules($true, $false, $sidType))) { $acl.RemoveAccessRuleSpecific($r) }
+    $acl.SetOwner((New-Object Security.Principal.SecurityIdentifier $script:SidAdmins))
+    $acl.SetAccessRuleProtection([bool]$Protect, $false)
+    if ($Protect) {
+        $inherit = 'None'
+        if ($item.PSIsContainer) { $inherit = 'ContainerInherit, ObjectInherit' }
+        $grants = @(@($script:SidSystem, 'FullControl'), @($script:SidAdmins, 'FullControl'))
+        if (-not $NoUsers) { $grants += , @($script:SidUsers, 'ReadAndExecute') }
+        foreach ($g in $grants) {
+            $acl.AddAccessRule((New-Object Security.AccessControl.FileSystemAccessRule(
+                (New-Object Security.Principal.SecurityIdentifier $g[0]), $g[1], $inherit, 'None', 'Allow')))
+        }
+    }
+    $item.SetAccessControl($acl)
+}
+
+function Protect-FcTree {
+    # Below an already-protected dir (so nobody can add entries while we walk):
+    # links go, items a non-admin owns are deleted (config.json / github-token set
+    # aside as *.untrusted), everything else gets owner Administrators + inherited ACL.
+    param([string]$Dir, [string[]]$Trusted, $Notes, [string[]]$Skip = @())
+    foreach ($c in @((Get-Item -LiteralPath $Dir -Force).GetFileSystemInfos())) {
+        $p = $c.FullName
+        if ($Skip -contains $c.Name) { continue }
+        if (Test-FcLink $c) {
+            Remove-FcLink $c
+            [void]$Notes.Add("removed planted link $p")
+            continue
+        }
+        if (-not (Test-FcTrustedOwner -Path $p -Trusted $Trusted)) {
+            if (@('config.json', 'github-token') -contains $c.Name) {
+                $aside = "$p.untrusted"
+                if (Test-Path -LiteralPath $aside) { [IO.File]::Delete($aside) }
+                [IO.File]::Move($p, $aside)
+                [void]$Notes.Add("$p was not created by an administrator; ignored and moved to $aside")
+            } else {
+                if ($c.PSIsContainer) { [IO.Directory]::Delete($p, $true) } else { [IO.File]::Delete($p) }
+                [void]$Notes.Add("removed $p (not created by an administrator)")
+            }
+            continue
+        }
+        $secret = ($c.Name -eq 'github-token')
+        Set-FcAcl -Path $p -Protect:$secret -NoUsers:$secret
+        if ($c.PSIsContainer) { Protect-FcTree -Dir $p -Trusted $Trusted -Notes $Notes }
+    }
+}
+
+function Protect-FacilityCacheInstallDir {
+    # SYSTEM tasks run scripts and read config/token from here, so non-admins
+    # must not create, own or replace anything in it. Returns notes to report.
+    $dir = Get-FacilityCacheInstallDir
+    $notes = New-Object 'System.Collections.Generic.List[string]'
+    $trusted = Get-FcTrustedOwnerSids
+    $item = Get-Item -LiteralPath $dir -Force -ErrorAction SilentlyContinue
+    if ($item -and (Test-FcLink $item)) {
+        Remove-FcLink $item
+        [void]$notes.Add("removed planted link $dir")
+        $item = $null
+    } elseif ($item -and (-not $item.PSIsContainer -or -not (Test-FcTrustedOwner -Path $dir -Trusted $trusted))) {
+        # Pre-created by a non-admin. Set it aside untouched and start fresh: fixing
+        # it in place would leave any handle they already hold with its access.
+        $aside = "$dir.untrusted-" + [DateTime]::UtcNow.ToString('yyyyMMddHHmmss')
+        if ($item.PSIsContainer) { [IO.Directory]::Move($dir, $aside) } else { [IO.File]::Move($dir, $aside) }
+        [void]$notes.Add("$dir was not created by an administrator; moved to $aside (nothing in it is used)")
+        $item = $null
+    }
+    if (-not $item) { [void][IO.Directory]::CreateDirectory($dir) }
+    Set-FcAcl -Path $dir -Protect
+    # The pre-hardening shared-machine session dir is handled (token revoked) below.
+    Protect-FcTree -Dir $dir -Trusted $trusted -Notes $notes -Skip @('gh-session')
+    [void](Remove-TreehouseGitSessionDir -Base $dir -Rel 'gh-session')
+    return $notes.ToArray()
+}
+
+function New-FacilityCacheTempDir {
+    # Fresh, random, SYSTEM+Administrators-only dir for downloads/extraction,
+    # inside the hardened install dir (non-admins cannot create anything there,
+    # unlike SYSTEM's %TEMP% = C:\Windows\Temp).
+    $p = Join-Path (Get-FacilityCacheInstallDir) ('tmp-' + [guid]::NewGuid().ToString('N'))
+    if (Test-Path -LiteralPath $p) { throw "temp dir $p already exists" }
+    [void][IO.Directory]::CreateDirectory($p)
+    Set-FcAcl -Path $p -Protect -NoUsers
+    return $p
+}
+
+function Get-FcTrustedCommand {
+    # SYSTEM must not run a binary from a PATH entry a non-admin can write (a
+    # folder an admin made under C:\ inherits Authenticated Users modify). Only
+    # accept tools under Program Files, Windows, or this account's own profile.
+    param([string]$Name)
+    $roots = @($env:ProgramFiles, ${env:ProgramFiles(x86)}, $env:SystemRoot, $env:LOCALAPPDATA) |
+        Where-Object { $_ } | ForEach-Object { $_.TrimEnd('\') + '\' }
+    foreach ($c in @(Get-Command $Name -CommandType Application -All -ErrorAction SilentlyContinue)) {
+        $full = [IO.Path]::GetFullPath($c.Path)
+        foreach ($r in $roots) {
+            if ($full.StartsWith($r, [StringComparison]::OrdinalIgnoreCase)) { return $full }
+        }
+    }
+    return $null
+}
+
+function Invoke-FcSystemGit {
+    # git as SYSTEM/admin: never parse a global config (HOME or GIT_CONFIG_GLOBAL)
+    # that someone else could have written.
+    $git = Get-FcTrustedCommand git
+    if (-not $git) { return }
+    $prev = $env:GIT_CONFIG_GLOBAL
+    $env:GIT_CONFIG_GLOBAL = '/dev/null'
+    try { & $git @args } finally { $env:GIT_CONFIG_GLOBAL = $prev }
+}
+
+function New-FcGitHubHeaders {
+    # The token is attached only to https://api.github.com. Windows PowerShell's
+    # web cmdlets drop Authorization on every redirect, so it never follows an
+    # asset download to objects.githubusercontent.com — and a redirected API call
+    # (old repo name) arrives unauthenticated, which is why callers avoid them.
+    param([string]$Uri, [string]$Token, [string]$Accept = 'application/vnd.github+json', [string]$Agent = 'facility-cache-client')
+    $h = @{ 'User-Agent' = $Agent; Accept = $Accept }
+    $u = [Uri]$Uri
+    if ($Token -and $u.Scheme -eq 'https' -and $u.Host -eq 'api.github.com') { $h['Authorization'] = "Bearer $Token" }
+    return $h
 }
 
 $script:FcCmd = ''
@@ -239,7 +417,8 @@ function Get-FacilityCacheConfig {
     }
     $tokenFile = Join-Path $dir 'github-token'
     if (Test-Path $tokenFile) {
-        $cfg['GitHubToken'] = (Get-Content -LiteralPath $tokenFile -Raw).Trim()
+        # SYSTEM/Administrators only: members (Status, treehouse-git) cannot read it.
+        try { $cfg['GitHubToken'] = ([string](Get-Content -LiteralPath $tokenFile -Raw -ErrorAction Stop)).Trim() } catch { }
     }
     if ($env:GITHUB_TOKEN) { $cfg['GitHubToken'] = $env:GITHUB_TOKEN }
     return $cfg
@@ -527,70 +706,101 @@ allow-insecure-host = ["$($cfg.CacheHost)"]
         Set-MachineEnv -Name 'UV_INSECURE_HOST' -Value $null
     }
 
-    $npmCmd = Get-Command npm -ErrorAction SilentlyContinue
+    $npmCmd = Get-FcTrustedCommand npm
     if ($npmOn) {
         Set-MachineEnv -Name 'NPM_CONFIG_REGISTRY' -Value $npm
         if ($npmCmd) {
-            & npm config set registry $npm --location=global 2>$null
+            & $npmCmd config set registry $npm --location=global 2>$null
         }
     } else {
         Set-MachineEnv -Name 'NPM_CONFIG_REGISTRY' -Value $null
         if ($npmCmd) {
             # Only clear the global registry if it's still pointed at ours — never
             # blow away a registry someone else configured.
-            $currentRegistry = (& npm config get registry --location=global 2>$null)
+            $currentRegistry = (& $npmCmd config get registry --location=global 2>$null)
             if ($currentRegistry -and $currentRegistry.Trim() -eq $npm) {
-                & npm config delete registry --location=global 2>$null
+                & $npmCmd config delete registry --location=global 2>$null
             }
         }
+    }
+
+    # An admin may add github-token after install; it inherits Users read. Fix that.
+    $tok = Join-Path (Get-FacilityCacheInstallDir) 'github-token'
+    if (Test-Path -LiteralPath $tok -PathType Leaf) {
+        $other = @((Get-Acl -LiteralPath $tok).GetAccessRules($true, $true, [Security.Principal.SecurityIdentifier]) |
+            Where-Object { @($script:SidSystem, $script:SidAdmins) -notcontains $_.IdentityReference.Value })
+        if ($other.Count -gt 0) { Set-FcAcl -Path $tok -Protect -NoUsers }
     }
 
     Set-TreehouseGitSharedMachine
 }
 
-# Shared-machine GitHub sign-in (treehouse-git). One session per MACHINE, not per
-# user: shared machines have one Windows account, and SYSTEM tasks must be able
-# to wipe it at logon/logoff/startup.
+# Shared-machine GitHub sign-in (treehouse-git). The session lives in each
+# account's OWN profile and is published through USER-scope env vars written
+# into that account's hive, never machine scope: no other account, no elevated
+# shell of another account and no SYSTEM process ever reads a git/gh config a
+# member could write. SYSTEM wipes every profile's session at startup, logon,
+# logoff and expiry.
 function Get-TreehouseGitSessionDir {
-    return (Join-Path (Get-FacilityCacheInstallDir) 'gh-session')
+    param([string]$ProfileDir = $env:USERPROFILE)
+    return (Join-Path $ProfileDir $script:SessionRel)
+}
+
+function Get-FcUserProfiles {
+    # SID + profile dir of every account except SYSTEM / LocalService / NetworkService.
+    $key = 'HKLM:\SOFTWARE\Microsoft\Windows NT\CurrentVersion\ProfileList'
+    foreach ($k in @(Get-ChildItem -LiteralPath $key -ErrorAction SilentlyContinue)) {
+        $sid = $k.PSChildName
+        if ($sid -notmatch '^S-1-[\d-]+$' -or @('S-1-5-18', 'S-1-5-19', 'S-1-5-20') -contains $sid) { continue }
+        $dir = [Environment]::ExpandEnvironmentVariables([string]$k.GetValue('ProfileImagePath'))
+        if ($dir) { [pscustomobject]@{ Sid = $sid; Dir = $dir } }
+    }
 }
 
 function Get-TreehouseGitSessionExpiry {
     # 0 when missing or unparseable, so callers fail closed (treat as expired).
+    param([string]$Dir = (Get-TreehouseGitSessionDir))
     $exp = [long]0
     try {
-        $raw = Get-Content -LiteralPath (Join-Path (Get-TreehouseGitSessionDir) 'expires') -Raw -ErrorAction Stop
+        $raw = Get-Content -LiteralPath (Join-Path $Dir 'expires') -Raw -ErrorAction Stop
         [void][long]::TryParse(([string]$raw).Trim(), [ref]$exp)
     } catch { }
     return $exp
 }
 
-function Reset-TreehouseGitSession {
-    # Revokes any gh token on GitHub, then deletes the session dir's CONTENTS
-    # (the dir and its ACL stay; a non-admin member could not recreate them).
-    # Runs as SYSTEM (tasks) and as the member (signout), on a member-writable dir.
-    param([switch]$OnlyIfExpired)
-    $d = Get-TreehouseGitSessionDir
-    $item = Get-Item -LiteralPath $d -Force -ErrorAction SilentlyContinue
-    if (-not $item) { return }
-    if (-not $item.PSIsContainer -or ($item.Attributes -band [IO.FileAttributes]::ReparsePoint)) {
-        # Planted file/junction: remove the link itself, never read or wipe a target as SYSTEM.
-        if ($item.PSIsContainer) { [IO.Directory]::Delete($d, $false) } else { [IO.File]::Delete($d) }
-        return
+function Get-FcSessionToken {
+    # Token-shaped strings from <session>\gh\hosts.yml. Member-writable, read by
+    # SYSTEM: refuse a link or non-regular file at every component.
+    param([string]$Dir)
+    $gh = Get-Item -LiteralPath (Join-Path $Dir 'gh') -Force -ErrorAction SilentlyContinue
+    if (-not $gh -or -not $gh.PSIsContainer -or (Test-FcLink $gh)) { return @() }
+    $hosts = Get-Item -LiteralPath (Join-Path $gh.FullName 'hosts.yml') -Force -ErrorAction SilentlyContinue
+    if (-not $hosts -or $hosts.PSIsContainer -or (Test-FcLink $hosts)) { return @() }
+    return @(Get-Content -LiteralPath $hosts.FullName -ErrorAction SilentlyContinue | ForEach-Object {
+        if ($_ -cmatch '^\s*oauth_token:\s*(gh[a-z]_[A-Za-z0-9_]+)\s*$') { $Matches[1] }
+    } | Select-Object -Unique)
+}
+
+function Remove-TreehouseGitSessionDir {
+    # Revokes the session's gh token on GitHub, then deletes the whole session dir
+    # $Base\$Rel. Walks down from the trusted $Base so SYSTEM never follows a
+    # link a member planted on the way. $true when the dir is gone afterwards.
+    param([string]$Base, [string]$Rel, [switch]$OnlyIfExpired)
+    $d = $Base
+    $parts = $Rel.Split('\')
+    for ($i = 0; $i -lt $parts.Count; $i++) {
+        $d = Join-Path $d $parts[$i]
+        $item = Get-Item -LiteralPath $d -Force -ErrorAction SilentlyContinue
+        if (-not $item) { return $true }
+        if ((Test-FcLink $item) -or -not $item.PSIsContainer) {
+            # Our own FacilityCache\gh-session names: drop the planted link/file itself.
+            if ($i -ge $parts.Count - 2) { Remove-FcLink $item; return $true }
+            Write-FcWarn "not resetting the GitHub session under $d (it is a link)"
+            return $false
+        }
     }
-    $children = @(Get-ChildItem -LiteralPath $d -Force)
-    if ($OnlyIfExpired) {
-        if ($children.Count -eq 0) { return }
-        if ([DateTimeOffset]::UtcNow.ToUnixTimeSeconds() -lt (Get-TreehouseGitSessionExpiry)) { return }
-    }
-    $hosts = Join-Path $d 'gh\hosts.yml'
-    $tokens = @()
-    if (Test-Path -LiteralPath $hosts -PathType Leaf) {
-        # User-writable file read by SYSTEM: only ever post strings shaped like gh tokens.
-        $tokens = @(Get-Content -LiteralPath $hosts -ErrorAction SilentlyContinue | ForEach-Object {
-            if ($_ -cmatch '^\s*oauth_token:\s*(gh[a-z]_[A-Za-z0-9_]+)\s*$') { $Matches[1] }
-        } | Select-Object -Unique)
-    }
+    if ($OnlyIfExpired -and [DateTimeOffset]::UtcNow.ToUnixTimeSeconds() -lt (Get-TreehouseGitSessionExpiry -Dir $d)) { return $true }
+    $tokens = @(Get-FcSessionToken -Dir $d)
     if ($tokens.Count -gt 0) {
         try {
             [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
@@ -605,54 +815,124 @@ function Reset-TreehouseGitSession {
             Write-FcWarn "could not revoke the GitHub token: $($_.Exception.Message)"
         }
     }
-    foreach ($c in $children) {
-        # .NET's recursive delete removes junctions/symlinks without following them;
-        # PS 5.1's Remove-Item -Recurse does follow them, so do not use it here.
-        if ($c.PSIsContainer) { [IO.Directory]::Delete($c.FullName, $true) } else { [IO.File]::Delete($c.FullName) }
+    # .NET's recursive delete removes junctions/symlinks inside without following
+    # them; PS 5.1's Remove-Item -Recurse does follow them, so do not use it here.
+    try {
+        [IO.Directory]::Delete($d, $true)
+    } catch {
+        # Locked or ACL-denied leftovers: move the whole dir off the configured
+        # path so nothing reads it as config, then retry deleting it below.
+        try { [IO.Directory]::Move($d, "$d.stale-" + [guid]::NewGuid().ToString('N')) } catch { }
     }
+    foreach ($s in @(Get-ChildItem -LiteralPath (Split-Path -Parent $d) -Force -Filter 'gh-session.stale-*' -ErrorAction SilentlyContinue)) {
+        try { if (Test-FcLink $s) { Remove-FcLink $s } else { [IO.Directory]::Delete($s.FullName, $true) } } catch { }
+    }
+    if (Test-Path -LiteralPath $d) {
+        Write-FcFail "could not remove the GitHub session at $d; sign-in stays blocked until it is gone (log off, or restart)"
+        return $false
+    }
+    return $true
+}
+
+function Reset-TreehouseGitSession {
+    # As a member (signin/signout): their own profile's session. As SYSTEM/admin
+    # (tasks, install, uninstall): every profile, plus the pre-per-user location
+    # inside the install dir. Returns $false if any session could not be removed.
+    param([switch]$OnlyIfExpired)
+    if (-not (Test-FcElevated)) {
+        return (Remove-TreehouseGitSessionDir -Base $env:USERPROFILE -Rel $script:SessionRel -OnlyIfExpired:$OnlyIfExpired)
+    }
+    $ok = Remove-TreehouseGitSessionDir -Base (Get-FacilityCacheInstallDir) -Rel 'gh-session'
+    foreach ($p in @(Get-FcUserProfiles)) {
+        if (-not (Remove-TreehouseGitSessionDir -Base $p.Dir -Rel $script:SessionRel -OnlyIfExpired:$OnlyIfExpired)) { $ok = $false }
+    }
+    return $ok
+}
+
+function Set-TreehouseGitUserEnv {
+    # Sets (or -Remove) GH_CONFIG_DIR / GIT_CONFIG_GLOBAL at USER scope in each
+    # account's hive, pointing into that account's own profile. Loaded hives only
+    # unless -IncludeUnloaded (uninstall). Takes effect at that account's next logon.
+    param([switch]$Remove, [switch]$IncludeUnloaded)
+    $users = [Microsoft.Win32.Registry]::Users
+    $loaded = $users.GetSubKeyNames()
+    $reg = Join-Path $env:SystemRoot 'System32\reg.exe'
+    foreach ($p in @(Get-FcUserProfiles)) {
+        $root = $p.Sid
+        $mounted = $false
+        if ($loaded -notcontains $p.Sid) {
+            $hive = Join-Path $p.Dir 'NTUSER.DAT'
+            if (-not $IncludeUnloaded -or -not (Test-Path -LiteralPath $hive)) { continue }
+            $root = 'facility-cache-' + [guid]::NewGuid().ToString('N')
+            & $reg load "HKU\$root" $hive 2>$null | Out-Null
+            if ($LASTEXITCODE -ne 0) { continue }
+            $mounted = $true
+        }
+        try {
+            $d = Get-TreehouseGitSessionDir -ProfileDir $p.Dir
+            $want = @{ GH_CONFIG_DIR = (Join-Path $d 'gh'); GIT_CONFIG_GLOBAL = (Join-Path $d 'gitconfig') }
+            $k = $users.CreateSubKey("$root\Environment")
+            try {
+                foreach ($n in $want.Keys) {
+                    $cur = $k.GetValue($n, $null, 'DoNotExpandEnvironmentNames')
+                    if ($Remove) {
+                        if ($cur -eq $want[$n]) { $k.DeleteValue($n) }
+                    } elseif ($cur -ne $want[$n]) {
+                        $k.SetValue($n, $want[$n], 'String')
+                    }
+                }
+            } finally {
+                $k.Close()
+            }
+        } catch {
+            Write-FcWarn "could not update GitHub session env for $($p.Sid): $($_.Exception.Message)"
+        } finally {
+            if ($mounted) {
+                [GC]::Collect(); [GC]::WaitForPendingFinalizers()
+                & $reg unload "HKU\$root" 2>$null | Out-Null
+            }
+        }
+    }
+}
+
+function Disable-TreehouseGitSharedMachine {
+    # SharedMachine off / uninstall: remove our user-scope env, the system git
+    # include, and every session.
+    param([switch]$IncludeUnloaded)
+    Set-TreehouseGitUserEnv -Remove -IncludeUnloaded:$IncludeUnloaded
+    $include = (Join-Path (Get-FacilityCacheInstallDir) 'shared.gitconfig').Replace('\', '/')
+    if (@(Invoke-FcSystemGit config --system --get-all include.path 2>$null) -contains $include) {
+        Invoke-FcSystemGit config --system --fixed-value --unset-all include.path $include
+    }
+    [void](Reset-TreehouseGitSession)
 }
 
 function Set-TreehouseGitSharedMachine {
     $cfg = Get-FacilityCacheConfig
-    $d = Get-TreehouseGitSessionDir
-    $ghDir = Join-Path $d 'gh'
-    $gitCfg = Join-Path $d 'gitconfig'
+    # Earlier versions published one member-writable dir at MACHINE scope; drop those.
+    $old = Join-Path (Get-FacilityCacheInstallDir) 'gh-session'
+    if ([Environment]::GetEnvironmentVariable('GH_CONFIG_DIR', 'Machine') -eq (Join-Path $old 'gh')) {
+        Set-MachineEnv -Name 'GH_CONFIG_DIR' -Value $null
+    }
+    if ([Environment]::GetEnvironmentVariable('GIT_CONFIG_GLOBAL', 'Machine') -eq (Join-Path $old 'gitconfig')) {
+        Set-MachineEnv -Name 'GIT_CONFIG_GLOBAL' -Value $null
+    }
+    if ($cfg.SharedMachine -ne $true) {
+        Disable-TreehouseGitSharedMachine
+        return
+    }
+    [void](Reset-TreehouseGitSession -OnlyIfExpired)
+    Set-TreehouseGitUserEnv
     $include = (Join-Path (Get-FacilityCacheInstallDir) 'shared.gitconfig').Replace('\', '/')
-    $git = Get-Command git -ErrorAction SilentlyContinue
-    $includes = @()
-    if ($git) { $includes = @(& git config --system --get-all include.path 2>$null) }
-    if ($cfg.SharedMachine -eq $true) {
-        Reset-TreehouseGitSession -OnlyIfExpired
-        if (-not (Test-Path -LiteralPath $d)) {
-            New-Item -ItemType Directory -Path $d -Force | Out-Null
-            # BUILTIN\Users modify, by SID so it works on any display language.
-            & icacls.exe $d /grant '*S-1-5-32-545:(OI)(CI)M' | Out-Null
-            if ($LASTEXITCODE -ne 0) { Write-FcWarn "icacls on $d exited $LASTEXITCODE" }
-        }
-        Set-MachineEnv -Name 'GH_CONFIG_DIR' -Value $ghDir
-        Set-MachineEnv -Name 'GIT_CONFIG_GLOBAL' -Value $gitCfg
-        if ($git -and $includes -notcontains $include) {
-            & git config --system --add include.path $include
-        }
-    } else {
-        if ([Environment]::GetEnvironmentVariable('GH_CONFIG_DIR', 'Machine') -eq $ghDir) {
-            Set-MachineEnv -Name 'GH_CONFIG_DIR' -Value $null
-        }
-        if ([Environment]::GetEnvironmentVariable('GIT_CONFIG_GLOBAL', 'Machine') -eq $gitCfg) {
-            Set-MachineEnv -Name 'GIT_CONFIG_GLOBAL' -Value $null
-        }
-        if ($git -and $includes -contains $include) {
-            & git config --system --fixed-value --unset-all include.path $include
-        }
-        Reset-TreehouseGitSession
+    if (@(Invoke-FcSystemGit config --system --get-all include.path 2>$null) -notcontains $include) {
+        Invoke-FcSystemGit config --system --add include.path $include
     }
 }
 
 function Start-TreehouseGitSession {
     # Member sign-in (non-admin). Returns $true when signed in.
     $cfg = Get-FacilityCacheConfig
-    $d = Get-TreehouseGitSessionDir
-    if ($cfg.SharedMachine -ne $true -or -not (Test-Path -LiteralPath $d -PathType Container)) {
+    if ($cfg.SharedMachine -ne $true) {
         Write-FcFail 'treehouse-git is only for shared machines (SharedMachine in config.json)'
         return $false
     }
@@ -662,7 +942,14 @@ function Start-TreehouseGitSession {
             return $false
         }
     }
-    Reset-TreehouseGitSession
+    # Fail closed: never sign in on top of anything an earlier session left behind.
+    if (-not (Reset-TreehouseGitSession)) { return $false }
+    $d = Get-TreehouseGitSessionDir
+    New-Item -ItemType Directory -Path $d -Force | Out-Null
+    if (@(Get-ChildItem -LiteralPath $d -Force).Count -ne 0) {
+        Write-FcFail "$d is not empty; not signing in"
+        return $false
+    }
     # Written before login so an interrupted sign-in still expires.
     $expires = [DateTimeOffset]::UtcNow.ToUnixTimeSeconds() + [long]([double]$cfg.GhSessionHours * 3600)
     Set-Content -LiteralPath (Join-Path $d 'expires') -Value $expires -Encoding ASCII
@@ -679,7 +966,7 @@ function Start-TreehouseGitSession {
     Write-Host ''
     & gh auth login --hostname github.com --git-protocol https --web --insecure-storage --skip-ssh-key | Out-Host
     if ($LASTEXITCODE -ne 0) {
-        Reset-TreehouseGitSession
+        [void](Reset-TreehouseGitSession)
         Write-FcFail 'GitHub sign-in did not complete'
         return $false
     }
@@ -694,7 +981,7 @@ function Start-TreehouseGitSession {
     }
     $f = @(([string]$info).Trim() -split "`t")
     if ($f.Count -lt 2 -or $f[0] -notmatch '^[A-Za-z0-9-]+$' -or $f[1] -notmatch '^\d+$') {
-        Reset-TreehouseGitSession
+        [void](Reset-TreehouseGitSession)
         Write-FcFail 'could not read your GitHub profile'
         return $false
     }
@@ -757,44 +1044,63 @@ function Update-GitHubCliPath {
     }
 }
 
+function Test-FcGitHubCliSigner {
+    # gh's MSI is Authenticode-signed (Microsoft Trusted Signing as of v2.104.0)
+    # with subject CN=GitHub, Inc. / O=GitHub, Inc. / C=US. Match those three RDNs
+    # exactly (case-sensitive); any other signer is refused.
+    param($Certificate)
+    $rdn = @{}
+    foreach ($line in ($Certificate.SubjectName.Format($true) -split "`r?`n")) {
+        if ($line -match '^\s*([A-Za-z]+)=(.*)$') { $rdn[$Matches[1]] = $Matches[2].Trim().Trim('"') }
+    }
+    return ($rdn['CN'] -ceq 'GitHub, Inc.' -and $rdn['O'] -ceq 'GitHub, Inc.' -and $rdn['C'] -ceq 'US')
+}
+
 function Sync-FacilityCacheGitHubCli {
     # Install gh if missing; winget-upgrade (or GitHub Releases MSI) if present.
-    # Returns $true when gh is on PATH afterwards. Never throws.
+    # Returns $true when a trusted gh (see Get-FcTrustedCommand) exists afterwards.
+    # Never throws.
     Update-GitHubCliPath
-    $winget = Get-Command winget -ErrorAction SilentlyContinue
-    $gh = Get-Command gh -ErrorAction SilentlyContinue
+    $winget = Get-FcTrustedCommand winget
+    $gh = Get-FcTrustedCommand gh
     if ($winget) {
         $wgArgs = @('--accept-package-agreements', '--accept-source-agreements')
         try {
             if ($gh) {
-                & $winget.Path upgrade --id GitHub.cli @wgArgs 2>$null | Out-Null
+                & $winget upgrade --id GitHub.cli @wgArgs 2>$null | Out-Null
             } else {
-                & $winget.Path install --id GitHub.cli -e --source winget @wgArgs 2>$null | Out-Null
+                & $winget install --id GitHub.cli -e --source winget @wgArgs 2>$null | Out-Null
             }
         } catch { }
         Update-GitHubCliPath
-        if (Get-Command gh -ErrorAction SilentlyContinue) { return $true }
+        if (Get-FcTrustedCommand gh) { return $true }
     }
+    $tmp = $null
     try {
-        $headers = @{
-            'User-Agent' = 'facility-cache-client'
-            Accept       = 'application/vnd.github+json'
-        }
+        $headers = New-FcGitHubHeaders -Uri 'https://api.github.com/repos/cli/cli/releases/latest'
         $release = Invoke-RestMethod -Uri 'https://api.github.com/repos/cli/cli/releases/latest' -Headers $headers
         $asset = $release.assets | Where-Object { $_.name -like '*windows_amd64.msi' } | Select-Object -First 1
-        if (-not $asset) { return [bool](Get-Command gh -ErrorAction SilentlyContinue) }
-        $msi = Join-Path $env:TEMP 'facility-cache-gh.msi'
-        Invoke-WebRequest -Uri $asset.browser_download_url -OutFile $msi -UseBasicParsing
-        $p = Start-Process -FilePath 'msiexec.exe' -ArgumentList @('/i', $msi, '/qn', '/norestart') -Wait -PassThru
-        Remove-Item -LiteralPath $msi -Force -ErrorAction SilentlyContinue
-        Update-GitHubCliPath
-        if ($p.ExitCode -ne 0 -and $p.ExitCode -ne 3010) {
-            return [bool](Get-Command gh -ErrorAction SilentlyContinue)
+        if ($asset) {
+            # Never a predictable path in SYSTEM's %TEMP% (C:\Windows\Temp is
+            # Users-writable): a member could pre-create and swap the MSI.
+            $tmp = New-FacilityCacheTempDir
+            $msi = Join-Path $tmp 'gh.msi'
+            Invoke-WebRequest -Uri $asset.browser_download_url -Headers $headers -OutFile $msi -UseBasicParsing
+            $sig = Get-AuthenticodeSignature -FilePath $msi
+            if ($sig.Status -ne 'Valid' -or -not $sig.SignerCertificate -or -not (Test-FcGitHubCliSigner $sig.SignerCertificate)) {
+                Write-FcWarn "gh MSI signature rejected (status $($sig.Status), signer $($sig.SignerCertificate.Subject)); not installing it"
+            } else {
+                $msiexec = Join-Path $env:SystemRoot 'System32\msiexec.exe'
+                Start-Process -FilePath $msiexec -ArgumentList @('/i', "`"$msi`"", '/qn', '/norestart') -Wait | Out-Null
+                Update-GitHubCliPath
+            }
         }
     } catch {
-        return [bool](Get-Command gh -ErrorAction SilentlyContinue)
+        Write-FcWarn "gh install from GitHub Releases failed: $($_.Exception.Message)"
+    } finally {
+        if ($tmp) { try { [IO.Directory]::Delete($tmp, $true) } catch { } }
     }
-    return [bool](Get-Command gh -ErrorAction SilentlyContinue)
+    return [bool](Get-FcTrustedCommand gh)
 }
 
 function Get-FacilityCacheAttestationBundle {
@@ -807,23 +1113,17 @@ function Get-FacilityCacheAttestationBundle {
     # or when nothing is left after filtering.
     param(
         [Parameter(Mandatory = $true)][string]$Path,
-        [Parameter(Mandatory = $true)][string]$Repo,
         [string]$Token,
-        [string]$RepoId
+        [Parameter(Mandatory = $true)][string]$RepoId
     )
     $hash = (Get-FileHash -LiteralPath $Path -Algorithm SHA256).Hash.ToLowerInvariant()
-    $headers = @{
-        'User-Agent' = 'facility-cache-client'
-        Accept       = 'application/vnd.github+json'
-    }
-    $uri = "https://api.github.com/repos/$Repo/attestations/sha256:$hash"
+    # By immutable id: no name, no redirect.
+    $uri = "https://api.github.com/repositories/$RepoId/attestations/sha256:$hash"
+    $headers = New-FcGitHubHeaders -Uri $uri
     $resp = $null
     if ($Token) {
-        $authHeaders = @{}
-        foreach ($k in $headers.Keys) { $authHeaders[$k] = $headers[$k] }
-        $authHeaders['Authorization'] = "Bearer $Token"
         try {
-            $resp = Invoke-WebRequest -Uri $uri -Headers $authHeaders -UseBasicParsing -TimeoutSec 30
+            $resp = Invoke-WebRequest -Uri $uri -Headers (New-FcGitHubHeaders -Uri $uri -Token $Token) -UseBasicParsing -TimeoutSec 30
         } catch {
             $status = 0
             if ($_.Exception.Response) { $status = [int]$_.Exception.Response.StatusCode }
@@ -863,27 +1163,63 @@ function Get-FacilityCacheAttestationBundle {
     return [string]::Join("`n", $lines.ToArray())
 }
 
+function Test-FcAttestationIdentity {
+    # Checks `gh attestation verify --format json` output against IMMUTABLE
+    # identity, not names (a pre-rename release names the old repo; a name can be
+    # re-registered). Some verified attestation must have: source repo id =
+    # $RepoId, owner id = $OwnerId, a GitHub Actions OIDC issuer, a GitHub-hosted
+    # runner, source ref refs/tags/v$Version, and signer/build workflow
+    # .github/workflows/release.yml of that same repo at that same tag.
+    # Returns '' when satisfied, else the reason. Any missing field fails.
+    param([string]$Json, [string]$RepoId, [string]$OwnerId, [string]$Version)
+    if ($RepoId -notmatch '^\d+$' -or $OwnerId -notmatch '^\d+$' -or $Version -notmatch '^v?\d+\.\d+\.\d+$') { return 'pinned repo id, owner id or version missing' }
+    try { $results = @(ConvertFrom-Json -InputObject $Json) } catch { return 'gh output is not JSON' }
+    $ref = 'refs/tags/v' + $Version.TrimStart('v')
+    $why = 'gh reported no verified attestation'
+    foreach ($r in $results) {
+        $c = $r.verificationResult.signature.certificate
+        if (-not $c -or -not $c.sourceRepositoryIdentifier) {
+            $why = 'this gh does not report the source repository id; upgrade gh'
+            continue
+        }
+        $wf = [string]$c.sourceRepositoryURI + '/.github/workflows/release.yml@' + $ref
+        if ([string]$c.sourceRepositoryIdentifier -ne $RepoId) { $why = "built in repo id $($c.sourceRepositoryIdentifier), not $RepoId" }
+        elseif ([string]$c.sourceRepositoryOwnerIdentifier -ne $OwnerId) { $why = "owner id $($c.sourceRepositoryOwnerIdentifier), not $OwnerId" }
+        elseif ([string]$c.issuer -cne 'https://token.actions.githubusercontent.com') { $why = "issuer $($c.issuer)" }
+        elseif ([string]$c.runnerEnvironment -cne 'github-hosted') { $why = "runner $($c.runnerEnvironment)" }
+        elseif ([string]$c.sourceRepositoryRef -cne $ref) { $why = "built from $($c.sourceRepositoryRef), not $ref" }
+        elseif (-not ([string]$c.sourceRepositoryURI).StartsWith('https://github.com/', [StringComparison]::Ordinal)) { $why = "source $($c.sourceRepositoryURI)" }
+        elseif ([string]$c.buildSignerURI -cne $wf -or [string]$c.buildConfigURI -cne $wf -or [string]$c.subjectAlternativeName -cne $wf) { $why = "signed by $($c.buildSignerURI), not $wf" }
+        else { return '' }
+    }
+    return $why
+}
+
 function Test-FacilityCacheAttestation {
-    # Best-effort, never-throws build-provenance check: verifies $Path's
-    # attestation bundle(s) (see Get-FacilityCacheAttestationBundle above)
-    # offline with `gh attestation verify --bundle`, which needs no
-    # `gh auth login` either. Returns $false on ANY failure: gh missing, no
-    # attestation published, network/API error, tampered file, or a
-    # wedged/failed gh process.
+    # Never-throws build-provenance check of $Path. gh does the cryptography
+    # offline (`--bundle`, no `gh auth login`); Test-FcAttestationIdentity then
+    # checks the certified identity. Returns '' when verified, else the reason.
+    # $Owner, $OwnerId come from /repositories/<pinned id>; $Version is the
+    # version being installed.
     param(
         [Parameter(Mandatory = $true)][string]$Path,
-        [Parameter(Mandatory = $true)][string]$Repo,
-        [string]$Token,
-        [string]$RepoId
+        [Parameter(Mandatory = $true)][string]$RepoId,
+        [Parameter(Mandatory = $true)][string]$Owner,
+        [Parameter(Mandatory = $true)][string]$OwnerId,
+        [Parameter(Mandatory = $true)][string]$Version,
+        [string]$Token
     )
     try {
-        $ghCmd = Get-Command gh -ErrorAction SilentlyContinue
-        if (-not $ghCmd) { return $false }
+        $ghPath = Get-FcTrustedCommand gh
+        if (-not $ghPath) { return 'gh not available' }
+        # It is spliced into gh's command line below.
+        if ($Owner -notmatch '^[A-Za-z0-9-]+$') { return "bad owner name $Owner" }
 
-        $bundleJsonl = Get-FacilityCacheAttestationBundle -Path $Path -Repo $Repo -Token $Token -RepoId $RepoId
-        if ($null -eq $bundleJsonl) { return $false }
+        $bundleJsonl = Get-FacilityCacheAttestationBundle -Path $Path -Token $Token -RepoId $RepoId
+        if ($null -eq $bundleJsonl) { return "no attestation published for repo id $RepoId" }
 
-        $bundleFile = Join-Path $env:TEMP ("facility-cache-bundle-" + [guid]::NewGuid().ToString() + '.jsonl')
+        # Next to $Path: callers keep it in a SYSTEM+Administrators-only temp dir.
+        $bundleFile = "$Path.bundle.jsonl"
         try {
             # The Rekor checkpoint envelope embeds a literal U+2014 em-dash,
             # so this is NOT ASCII-safe (that silently mangled it to '?' and
@@ -895,23 +1231,29 @@ function Test-FacilityCacheAttestation {
             # Process.Start + WaitForExit(timeout), not `&`, so a wedged gh
             # can't hang a scheduled task forever.
             $psi = New-Object System.Diagnostics.ProcessStartInfo
-            $psi.FileName = $ghCmd.Path
-            $psi.Arguments = "attestation verify `"$Path`" --repo $Repo --bundle `"$bundleFile`" --signer-workflow $Repo/.github/workflows/release.yml --deny-self-hosted-runners"
+            $psi.FileName = $ghPath
+            # --owner is required by gh; the real identity check is by id below.
+            $psi.Arguments = "attestation verify `"$Path`" --bundle `"$bundleFile`" --owner $Owner --deny-self-hosted-runners --format json"
+            # Never let gh read a config dir someone else could write.
+            $psi.EnvironmentVariables['GH_CONFIG_DIR'] = Split-Path -Parent $Path
             $psi.UseShellExecute = $false
             $psi.RedirectStandardOutput = $true
             $psi.RedirectStandardError = $true
             $proc = [System.Diagnostics.Process]::Start($psi)
-            if ($proc.WaitForExit(30000)) {
-                return ($proc.ExitCode -eq 0)
-            } else {
+            # Drain both pipes while waiting: the JSON is larger than a pipe buffer.
+            $out = $proc.StandardOutput.ReadToEndAsync()
+            $err = $proc.StandardError.ReadToEndAsync()
+            if (-not $proc.WaitForExit(60000)) {
                 $proc.Kill()
-                return $false
+                return 'gh attestation verify timed out'
             }
+            if ($proc.ExitCode -ne 0) { return "gh attestation verify failed: $(([string]$err.Result).Trim())" }
+            return (Test-FcAttestationIdentity -Json $out.Result -RepoId $RepoId -OwnerId $OwnerId -Version $Version)
         } finally {
             Remove-Item -LiteralPath $bundleFile -Force -ErrorAction SilentlyContinue
         }
     } catch {
-        return $false
+        return "attestation check error: $($_.Exception.Message)"
     }
 }
 
@@ -930,48 +1272,50 @@ function Update-FacilityCacheClient {
     [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
     $cfg = Get-FacilityCacheConfig
     $local = Get-FacilityCacheInstalledVersion
-    $repo = $cfg.GitHubRepo
+    $agent = "facility-cache-client/$local"
+    $token = $cfg.GitHubToken
+    $repoId = [string]$cfg.GitHubRepoId
     $script:FcStepN = 6
     Write-FcHeader 'facility-cache-client' "update  v$local"
-    Write-FcKv 'repo' $repo 'work'
+    Write-FcKv 'repo' "$($cfg.GitHubRepo)  (id $repoId)" 'work'
     Write-FcKv 'installed' $local 'ok'
-    $headers = @{
-        'User-Agent' = "facility-cache-client/$local"
-        Accept       = 'application/vnd.github+json'
-    }
-    if ($cfg.GitHubToken) { $headers['Authorization'] = "Bearer $($cfg.GitHubToken)" }
 
-    if ($cfg.GitHubRepoId) {
-        # A rename leaves the old name redirecting, so a re-registered name
-        # could serve someone else's releases; the numeric id is immutable.
-        Write-FcStep 'identity' "repo id $($cfg.GitHubRepoId)"
-        try {
-            $meta = Invoke-RestMethod -Uri "https://api.github.com/repos/$repo" -Headers $headers
-        } catch {
-            Write-FacilityCacheState @{ installed_version = $local; last_result = "github error: $($_.Exception.Message)" }
-            Write-FcFail $_
-            if ($Check) { throw }
-            Write-FcFinish -Ok $false -Message 'could not check GitHub'
-            return
-        }
-        if ([string]$meta.id -ne [string]$cfg.GitHubRepoId) {
-            Write-FacilityCacheState @{ installed_version = $local; last_result = "refused: repo id $($meta.id) != pinned $($cfg.GitHubRepoId)" }
-            Write-FcFail "Repo id $($meta.id) does not match pinned $($cfg.GitHubRepoId) — the name may have been re-registered; refusing to install from it"
-            if ($Check) { throw "repo id mismatch" }
-            Write-FcFinish -Ok $false -Message 'refusing to update'
-            return
-        }
-        if ($meta.full_name -ne $repo) {
-            Write-FcStepOk "id $($meta.id)  (now named $($meta.full_name))"
-            Write-FcNote "repo renamed to $($meta.full_name) — update GitHubRepo in config.json"
-        } else {
-            Write-FcStepOk "id $($meta.id)"
-        }
+    # Everything below is addressed by the immutable numeric id, never by a name:
+    # a renamed repo's old name can be re-registered by anyone, and the redirect
+    # GitHub sends for it makes Windows PowerShell drop the token (404 on private).
+    Write-FcStep 'identity' "repo id $repoId"
+    if ($repoId -notmatch '^\d+$') {
+        Write-FacilityCacheState @{ installed_version = $local; last_result = 'refused: GitHubRepoId is not set' }
+        Write-FcFail 'GitHubRepoId must be the numeric GitHub repository id; refusing to update from an unpinned name'
+        if ($Check) { throw 'GitHubRepoId not set' }
+        Write-FcFinish -Ok $false -Message 'refusing to update'
+        return
     }
+    try {
+        $metaUri = "https://api.github.com/repositories/$repoId"
+        $meta = Invoke-RestMethod -Uri $metaUri -Headers (New-FcGitHubHeaders -Uri $metaUri -Token $token -Agent $agent)
+    } catch {
+        Write-FacilityCacheState @{ installed_version = $local; last_result = "github error: $($_.Exception.Message)" }
+        Write-FcFail $_
+        if ($Check) { throw }
+        Write-FcFinish -Ok $false -Message 'could not check GitHub'
+        return
+    }
+    $repo = [string]$meta.full_name
+    if ([string]$meta.id -ne $repoId -or $repo -notmatch '^[A-Za-z0-9-]+/[A-Za-z0-9._-]+$') {
+        Write-FacilityCacheState @{ installed_version = $local; last_result = "refused: repo id $($meta.id) != pinned $repoId" }
+        Write-FcFail "GitHub answered repo id $($meta.id) ($repo) for pinned $repoId; refusing to install from it"
+        if ($Check) { throw "repo id mismatch" }
+        Write-FcFinish -Ok $false -Message 'refusing to update'
+        return
+    }
+    Write-FcStepOk "id $($meta.id)  $repo"
+    if ($repo -ne $cfg.GitHubRepo) { Write-FcNote "repo is now named $repo (GitHubRepo in config is display only)" }
 
     Write-FcStep 'github' 'latest release'
     try {
-        $release = Invoke-RestMethod -Uri "https://api.github.com/repos/$repo/releases/latest" -Headers $headers
+        $relUri = "https://api.github.com/repos/$repo/releases/latest"
+        $release = Invoke-RestMethod -Uri $relUri -Headers (New-FcGitHubHeaders -Uri $relUri -Token $token -Agent $agent)
     } catch {
         Write-FacilityCacheState @{ installed_version = $local; last_result = "github error: $($_.Exception.Message)" }
         Write-FcFail $_
@@ -989,73 +1333,75 @@ function Update-FacilityCacheClient {
         return
     }
 
-    $dlHeaders = @{
-        'User-Agent' = "facility-cache-client/$local"
-        Accept       = 'application/octet-stream'
-    }
-    if ($cfg.GitHubToken) { $dlHeaders['Authorization'] = "Bearer $($cfg.GitHubToken)" }
-
-    $tmpMan = Join-Path $env:TEMP 'facility-cache-manifest.json'
-    Invoke-WebRequest -Uri $assets['manifest.json'].url -Headers $dlHeaders -OutFile $tmpMan -UseBasicParsing
-    $manifest = Get-Content -LiteralPath $tmpMan -Raw | ConvertFrom-Json
-    $remote = ([string]$manifest.version).TrimStart('v')
-    Write-FcStepOk "$($release.tag_name)  v$remote"
-    Write-FcKv 'latest' "v$remote" $(if (Test-FacilityCacheVersionNewer $remote $local) { 'ok' } else { 'on' })
-    if ($Check) {
-        if (Test-FacilityCacheVersionNewer $remote $local) {
-            Write-FcOk "update available  v$local -> v$remote"
-        } else {
-            Write-FcOk 'already the latest release'
-        }
-        Write-FcFinish -Ok $true -Message "log $(Get-FacilityCacheLogPath)"
-        return
+    # Asset API URLs answer 302 to a signed objects.githubusercontent.com URL; the
+    # token is only ever attached for api.github.com and is dropped on redirect.
+    $save = {
+        param($Url, $OutFile)
+        Invoke-WebRequest -Uri $Url -Headers (New-FcGitHubHeaders -Uri $Url -Token $token -Accept 'application/octet-stream' -Agent $agent) -OutFile $OutFile -UseBasicParsing
     }
 
-    $auto = $true
-    if ($null -ne $cfg.AutoUpdate) {
-        $auto = [bool]$cfg.AutoUpdate
-        if ($cfg.AutoUpdate -is [string]) {
-            $auto = @('0', 'false', 'no', 'off') -notcontains $cfg.AutoUpdate.ToLowerInvariant()
-        }
-    }
-    if (-not $auto -and -not $Force) {
-        Write-FacilityCacheState @{
-            installed_version = $local
-            latest_version    = $remote
-            last_result       = 'auto-update disabled'
-        }
-        Write-FcWarn 'AutoUpdate is disabled — pass -Force to install'
-        Write-FcFinish -Ok $true -Message 'no changes'
-        return
-    }
-    if (-not $Force -and -not (Test-FacilityCacheVersionNewer -Remote $remote -Local $local)) {
-        Write-FacilityCacheState @{
-            installed_version = $local
-            latest_version    = $remote
-            last_result       = 'up-to-date'
-        }
-        Write-FcOk 'already up to date'
-        Write-FcStep 'gh' 'GitHub CLI'
-        if (Sync-FacilityCacheGitHubCli) {
-            Write-FcStepOk 'gh'
-        } else {
-            Write-FcWarn 'gh install skipped — attestations may be unavailable'
-        }
-        Write-FcFinish -Ok $true -Message "v$local"
-        return
-    }
-
-    $name = $manifest.assets.windows.name
-    $expect = ([string]$manifest.assets.windows.sha256).ToLowerInvariant()
-    if (-not $name -or -not $expect) { throw 'manifest.json missing windows asset name/sha256' }
-    if (-not $assets.ContainsKey($name)) { throw "release is missing asset $name" }
-
-    $tmp = Join-Path $env:TEMP ("facility-cache-" + [guid]::NewGuid().ToString())
-    New-Item -ItemType Directory -Path $tmp | Out-Null
+    $tmp = $null
+    $remote = $local
     try {
-        $zip = Join-Path $tmp $name
+        $tmp = New-FacilityCacheTempDir
+        $tmpMan = Join-Path $tmp 'manifest.json'
+        & $save $assets['manifest.json'].url $tmpMan
+        $manifest = Get-Content -LiteralPath $tmpMan -Raw | ConvertFrom-Json
+        $remote = ([string]$manifest.version).TrimStart('v')
+        Write-FcStepOk "$($release.tag_name)  v$remote"
+        Write-FcKv 'latest' "v$remote" $(if (Test-FacilityCacheVersionNewer $remote $local) { 'ok' } else { 'on' })
+        if ($Check) {
+            if (Test-FacilityCacheVersionNewer $remote $local) {
+                Write-FcOk "update available  v$local -> v$remote"
+            } else {
+                Write-FcOk 'already the latest release'
+            }
+            Write-FcFinish -Ok $true -Message "log $(Get-FacilityCacheLogPath)"
+            return
+        }
+
+        $auto = $true
+        if ($null -ne $cfg.AutoUpdate) {
+            $auto = [bool]$cfg.AutoUpdate
+            if ($cfg.AutoUpdate -is [string]) {
+                $auto = @('0', 'false', 'no', 'off') -notcontains $cfg.AutoUpdate.ToLowerInvariant()
+            }
+        }
+        if (-not $auto -and -not $Force) {
+            Write-FacilityCacheState @{
+                installed_version = $local
+                latest_version    = $remote
+                last_result       = 'auto-update disabled'
+            }
+            Write-FcWarn 'AutoUpdate is disabled — pass -Force to install'
+            Write-FcFinish -Ok $true -Message 'no changes'
+            return
+        }
+        if (-not $Force -and -not (Test-FacilityCacheVersionNewer -Remote $remote -Local $local)) {
+            Write-FacilityCacheState @{
+                installed_version = $local
+                latest_version    = $remote
+                last_result       = 'up-to-date'
+            }
+            Write-FcOk 'already up to date'
+            Write-FcStep 'gh' 'GitHub CLI'
+            if (Sync-FacilityCacheGitHubCli) {
+                Write-FcStepOk 'gh'
+            } else {
+                Write-FcWarn 'gh install skipped — the next update cannot verify build provenance'
+            }
+            Write-FcFinish -Ok $true -Message "v$local"
+            return
+        }
+
+        $name = $manifest.assets.windows.name
+        $expect = ([string]$manifest.assets.windows.sha256).ToLowerInvariant()
+        if (-not $name -or -not $expect) { throw 'manifest.json missing windows asset name/sha256' }
+        if (-not $assets.ContainsKey($name)) { throw "release is missing asset $name" }
+
+        $zip = Join-Path $tmp ([IO.Path]::GetFileName($name))
         Write-FcStep 'download' $name
-        Invoke-WebRequest -Uri $assets[$name].url -Headers $dlHeaders -OutFile $zip -UseBasicParsing
+        & $save $assets[$name].url $zip
         Write-FcStepOk $name
         Write-FcStep 'verify' 'sha256'
         $got = (Get-FileHash -LiteralPath $zip -Algorithm SHA256).Hash.ToLowerInvariant()
@@ -1063,29 +1409,30 @@ function Update-FacilityCacheClient {
         Write-FcStepOk ($got.Substring(0, 12) + '...')
 
         Write-FcStep 'gh' 'GitHub CLI'
-        if (Sync-FacilityCacheGitHubCli) {
-            Write-FcStepOk 'gh'
-        } else {
-            Write-FcWarn 'gh install skipped — attestations may be unavailable'
-        }
+        $haveGh = Sync-FacilityCacheGitHubCli
+        if ($haveGh) { Write-FcStepOk 'gh' }
 
-        # Best-effort supply-chain nicety on top of the sha256 check above,
-        # not a replacement for it: any failure to run/verify `gh` just logs
-        # a warning and falls back to trusting sha256, so a fleet without gh
-        # (or before attestations existed) never bricks. A hard-fail flag can
-        # come later.
+        # Nothing from the zip is extracted or run before this passes. With gh
+        # present a missing or failing attestation is fatal; only a machine where
+        # gh could not be installed falls back to sha256, and says so loudly.
         Write-FcStep 'attest' 'build provenance'
-        if (Test-FacilityCacheAttestation -Path $zip -Repo $repo -Token $cfg.GitHubToken -RepoId $cfg.GitHubRepoId) {
-            Write-FcStepOk 'verified'
+        if ($haveGh) {
+            $why = Test-FacilityCacheAttestation -Path $zip -RepoId $repoId -Owner ([string]$meta.owner.login) `
+                -OwnerId ([string]$meta.owner.id) -Version $remote -Token $token
+            if ($why) { throw "build-provenance attestation for $name v${remote} not accepted: $why; refusing to install" }
+            $attest = 'verified'
+            Write-FcStepOk $attest
         } else {
-            Write-FcWarn 'attestation unavailable — continuing on sha256 only'
+            $attest = 'NOT VERIFIED: gh unavailable, sha256 only'
+            Write-FcFail "gh could not be installed — installing v$remote WITHOUT build-provenance verification (sha256 only)"
         }
 
         Write-FcStep 'install' "v$remote"
-        Expand-Archive -LiteralPath $zip -DestinationPath $tmp -Force
-        $installer = Get-ChildItem -Path $tmp -Recurse -Filter 'Install-FacilityCache.ps1' | Select-Object -First 1
+        $src = Join-Path $tmp 'src'
+        Expand-Archive -LiteralPath $zip -DestinationPath $src -Force
+        $installer = Get-ChildItem -Path $src -Recurse -Filter 'Install-FacilityCache.ps1' | Select-Object -First 1
         if (-not $installer) { throw 'zip missing windows/Install-FacilityCache.ps1' }
-        & powershell.exe -NoProfile -ExecutionPolicy Bypass -File $installer.FullName -NoRestartDocker
+        & (Join-Path $env:SystemRoot 'System32\WindowsPowerShell\v1.0\powershell.exe') -NoProfile -ExecutionPolicy Bypass -File $installer.FullName -NoRestartDocker
         # & powershell.exe never throws; without this a failed installer was logged as "updated".
         if ($LASTEXITCODE -ne 0) { throw "Install-FacilityCache.ps1 exited $LASTEXITCODE" }
         Write-FcStepOk "v$remote"
@@ -1094,6 +1441,7 @@ function Update-FacilityCacheClient {
             latest_version    = $remote
             last_result       = 'updated'
             from_tag          = $release.tag_name
+            attestation       = $attest
         }
         Write-FcFinish -Ok $true -Message "now running v$remote"
     } catch {
@@ -1102,7 +1450,7 @@ function Update-FacilityCacheClient {
         Write-FcFinish -Ok $false -Message 'update failed'
         throw
     } finally {
-        Remove-Item -LiteralPath $tmp -Recurse -Force -ErrorAction SilentlyContinue
+        if ($tmp) { try { [IO.Directory]::Delete($tmp, $true) } catch { } }
     }
 }
 
@@ -1122,7 +1470,9 @@ Export-ModuleMember -Function @(
     'Update-FacilityCacheClient',
     'Sync-FacilityCacheGitHubCli',
     'Test-FacilityCacheAttestation',
+    'Protect-FacilityCacheInstallDir',
     'Reset-TreehouseGitSession', 'Start-TreehouseGitSession', 'Show-TreehouseGitSession',
+    'Disable-TreehouseGitSharedMachine',
     'Write-FcHeader', 'Write-FcKv', 'Write-FcOk', 'Write-FcFail', 'Write-FcWarn',
     'Write-FcNote', 'Write-FcStep', 'Write-FcStepOk', 'Write-FcBar', 'Write-FcFinish'
 )
