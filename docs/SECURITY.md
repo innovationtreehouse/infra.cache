@@ -266,9 +266,18 @@ State observed via read-only `gh api` on 2026-11-14:
   `$XDG_RUNTIME_DIR/treehouse-gh` (tmpfs) on Linux, and
   `%LOCALAPPDATA%\FacilityCache\gh-session` in each account's own profile
   on Windows.
-- Root/SYSTEM sweeps sessions at logout/logon and at expiry, and revokes the
-  token through GitHub's credential-revocation API. They never follow a link
-  a member planted inside a session.
+- Root/SYSTEM deletes sessions at logout/logon and at expiry. They never
+  follow a link a member planted inside a session, and they never read the
+  token.
+- Session tokens are deleted, **not revoked** on GitHub. On 2026-11-14,
+  `POST /credentials/revoke` with a single GitHub CLI (`gho_`) token was
+  observed to invalidate that user's other GitHub CLI logins on other
+  machines as well.
+  - Residual risk: a token copied out of a live session stays valid until
+    the member revokes "GitHub CLI" at https://github.com/settings/applications,
+    which signs `gh` out on all their devices.
+  - Planned fix: an org-owned GitHub App with expiring user-to-server
+    tokens.
 - Git takes GitHub credentials only from that session (`shared.gitconfig`).
   The helper does not call `gh` when there is no session, because `gh` would
   fall back to a token in the OS keyring left by an earlier plain

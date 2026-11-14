@@ -52,7 +52,9 @@ On opted-in shared-login computers, each member signs in to GitHub as
 themself with `treehouse-git signin`, so commits are attributed to them. At
 desktop login a terminal window opens and offers the sign-in, and new bash /
 Git Bash terminals show a one-line "signed in as …" or "not signed in" hint. The sign-in ends at logout, on `treehouse-git signout`, or
-after 36 hours. See [docs/SHARED-MACHINES.md](docs/SHARED-MACHINES.md).
+after 36 hours. Each of those deletes the token from the computer but does not
+revoke it on GitHub, because revoking was seen to sign the member out of `gh`
+on their other devices too. See [docs/SHARED-MACHINES.md](docs/SHARED-MACHINES.md).
 
 ## Install and enable
 

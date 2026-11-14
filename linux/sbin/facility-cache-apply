@@ -356,7 +356,7 @@ else
   rm -f "$SHELL_HINT"
 fi
 
-# Expire shared GitHub sessions (also revokes their tokens).
+# Expire shared GitHub sessions (deleted locally; see treehouse-git end_session).
 if [[ -x /usr/local/bin/treehouse-git ]]; then
   /usr/local/bin/treehouse-git sweep || true
 fi

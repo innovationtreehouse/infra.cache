@@ -41,7 +41,7 @@ Unregister-ScheduledTask -TaskName 'FacilityCache-Update' -Confirm:$false -Error
 Unregister-ScheduledTask -TaskName 'FacilityCache-SessionReset' -Confirm:$false -ErrorAction SilentlyContinue
 Write-FcStepOk 'Apply + Update + SessionReset unregistered'
 
-# Shared-machine GitHub sign-in: revoke + delete every profile's session, drop
+# Shared-machine GitHub sign-in: delete every profile's session, drop
 # the user-scope env vars (also from hives of accounts not logged on) and the
 # system git include, while the module is still loaded.
 if (Get-Command Disable-TreehouseGitSharedMachine -ErrorAction SilentlyContinue) {
