@@ -104,7 +104,7 @@ print_status() {
     net="wrong address"
     netkind=fail
   fi
-  [[ -r "$VERSION_FILE" ]] && ver="$(tr -d ' v\n' <"$VERSION_FILE")"
+  [[ -r "$VERSION_FILE" ]] && ver="$(tr -d ' \n' <"$VERSION_FILE")" && ver="${ver#v}"
   ui_init status
   ui_banner "facility-cache-client" "v${ver}"
   ui_kv "network" "$net" "$netkind"
