@@ -309,6 +309,53 @@ if command -v git >/dev/null 2>&1; then
     git config --system --fixed-value --unset-all include.path "$SHARED_GITCONFIG" 2>/dev/null || true
   fi
 fi
+# Shared machines: offer GitHub sign-in to members. Both files are root-owned
+# and regenerated here, so a member cannot change what the next login runs.
+#  - XDG autostart entry: desktop logins only (not SSH, not lock/unlock).
+#  - bash-completion drop-in: sourced by every interactive bash whose
+#    ~/.bashrc loads bash-completion (Ubuntu's default), never by scripts or
+#    `ssh host cmd`; avoids editing /etc/bash.bashrc, a dpkg conffile.
+WELCOME_DESKTOP=/etc/xdg/autostart/treehouse-git-welcome.desktop
+SHELL_HINT=/etc/bash_completion.d/treehouse-git
+write_if_changed() { # write_if_changed <path> (content on stdin)
+  local tmp
+  tmp="$(mktemp)"
+  cat >"$tmp"
+  if cmp -s "$tmp" "$1"; then
+    rm -f "$tmp"
+  else
+    install -D -m 0644 -o root -g root "$tmp" "$1"
+    rm -f "$tmp"
+  fi
+}
+if shared_machine && signin_prompt_at_login; then
+  write_if_changed "$WELCOME_DESKTOP" <<'EOT'
+[Desktop Entry]
+# facility-cache-managed: offer GitHub sign-in at login on this shared machine.
+Type=Application
+Name=GitHub sign-in
+Comment=Sign in to GitHub as yourself on this shared computer
+Exec=/usr/local/bin/treehouse-git welcome --launch
+TryExec=/usr/local/bin/treehouse-git
+NoDisplay=true
+X-GNOME-Autostart-enabled=true
+EOT
+else
+  rm -f "$WELCOME_DESKTOP"
+fi
+if shared_machine; then
+  write_if_changed "$SHELL_HINT" <<'EOT'
+# facility-cache-managed: GitHub sign-in hint for interactive shells on this shared machine.
+# shellcheck shell=bash
+if [[ $- == *i* && $EUID -ne 0 && -x /usr/local/bin/treehouse-git ]]; then
+  /usr/local/bin/treehouse-git hint
+fi
+complete -W "signin signout status" treehouse-git
+EOT
+else
+  rm -f "$SHELL_HINT"
+fi
+
 # Expire shared GitHub sessions (also revokes their tokens).
 if [[ -x /usr/local/bin/treehouse-git ]]; then
   /usr/local/bin/treehouse-git sweep || true

@@ -14,6 +14,7 @@ GITHUB_REPO="${GITHUB_REPO:-innovationtreehouse/infra.cache}"
 AUTO_UPDATE="${AUTO_UPDATE:-1}"
 SHARED_MACHINE="${SHARED_MACHINE:-0}"
 GH_SESSION_HOURS="${GH_SESSION_HOURS:-36}"
+SIGNIN_PROMPT_AT_LOGIN="${SIGNIN_PROMPT_AT_LOGIN:-1}"
 # shellcheck disable=SC2034  # read by facility-cache-apply
 SHARED_GITCONFIG="/usr/local/lib/facility-cache/shared.gitconfig"
 
@@ -51,6 +52,10 @@ fi
 
 shared_machine() {
   [[ "$SHARED_MACHINE" == 1 || "$SHARED_MACHINE" == true ]]
+}
+
+signin_prompt_at_login() {
+  [[ "$SIGNIN_PROMPT_AT_LOGIN" == 1 || "$SIGNIN_PROMPT_AT_LOGIN" == true ]]
 }
 
 cache_base_url() {

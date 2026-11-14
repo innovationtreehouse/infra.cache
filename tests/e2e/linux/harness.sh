@@ -188,11 +188,29 @@ grep -q '^TREEHOUSE_SHARED_MACHINE=1' /run/facility-cache/env
 ck "env file flags shared machine" $?
 grep -q '^GH_CONFIG_DIR=' /etc/environment.d/60-facility-cache.conf
 ck "environment.d sets GH_CONFIG_DIR" $?
+WD=/etc/xdg/autostart/treehouse-git-welcome.desktop
+SH=/etc/bash_completion.d/treehouse-git
+[ "$(stat -c '%U %a' "$WD" 2>/dev/null)" = "root 644" ] && grep -qxF 'Exec=/usr/local/bin/treehouse-git welcome --launch' "$WD"
+ck "login prompt autostart entry (root 644)" $?
+[ "$(stat -c '%U %a' "$SH" 2>/dev/null)" = "root 644" ]
+ck "shell hint drop-in (root 644)" $?
+out="$(setpriv --reuid=65534 --regid=65534 --clear-groups bash --rcfile "$SH" -ic 'true' 2>/dev/null </dev/null)"
+[ "$out" = "Not signed in to GitHub. Run: treehouse-git signin" ]
+ck "shell hint printed once by an interactive shell (non-root)" $? "$out"
+out="$(setpriv --reuid=65534 --regid=65534 --clear-groups bash -c "source $SH" 2>&1)"
+[ -z "$out" ]
+ck "shell hint silent for non-interactive shells" $? "$out"
+write_config "SHARED_MACHINE=1" "SIGNIN_PROMPT_AT_LOGIN=0"
+/usr/local/sbin/facility-cache-apply
+[ ! -e "$WD" ] && [ -e "$SH" ]
+ck "SIGNIN_PROMPT_AT_LOGIN=0 removes only the login prompt" $?
 write_config
 /usr/local/sbin/facility-cache-apply
 ck "non-shared apply exit 0" $?
 ! git config --system --get-all include.path 2>/dev/null | grep -q shared.gitconfig
 ck "system gitconfig include removed" $?
+[ ! -e "$WD" ] && [ ! -e "$SH" ]
+ck "not shared: no login prompt, no shell hint" $?
 
 sec "T10 update: --check, repo-id pin refusal, then full update (real GitHub + attestation)"
 echo 1.0.0 >/usr/local/lib/facility-cache/VERSION
@@ -224,8 +242,11 @@ ck "facility-cache log --json" $?
 sec "T11 uninstall"
 # T10 installed the latest RELEASE, including its uninstaller; reinstall this
 # tree so T11 exercises the uninstaller under test.
+write_config "SHARED_MACHINE=1"
 bash /opt/src/linux/install.sh >/dev/null 2>&1
 ck "reinstall from tree exit 0" $?
+[ -e "$WD" ] && [ -e "$SH" ]
+ck "shared reinstall: login prompt + shell hint present" $?
 facility-cache uninstall
 ck "uninstall exit 0" $?
 [ ! -e /usr/local/sbin/facility-cache-apply ] && [ ! -e /usr/local/bin/facility-cache ] && [ ! -d /usr/local/lib/facility-cache ]
@@ -241,6 +262,8 @@ ck "daemon.json restored from backup" $?
 ck "pre-restore snapshot kept" $?
 [ ! -e /usr/local/bin/treehouse-git ]
 ck "treehouse-git removed" $?
+[ ! -e "$WD" ] && [ ! -e "$SH" ]
+ck "login prompt + shell hint removed" $?
 [ -f /etc/facility-cache/config ]
 ck "local config left in place" $?
 [ ! -f /etc/xdg/pip/pip.conf ] && [ ! -f /etc/npmrc ]

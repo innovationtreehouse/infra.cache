@@ -11,8 +11,21 @@ Start-Sleep -Seconds 3
 if ($cache.HasExited) { Get-Content cache.err; throw 'fake cache failed to start' }
 
 Write-Host '--- client container (servercore ltsc2022, PS 5.1) ---'
+# The runner image sometimes hands over the job before the Docker engine is up
+# (seen as "failed to connect to the docker API at npipe:////./pipe/docker_engine").
+# Start it if needed and wait; cmd swallows stderr so PS 5.1 + Stop does not throw.
+$dockerReady = $false
+foreach ($i in 1..40) {
+    cmd /c 'docker version >nul 2>&1'
+    if ($LASTEXITCODE -eq 0) { $dockerReady = $true; break }
+    if ($i -eq 1) { Start-Service docker -ErrorAction SilentlyContinue }
+    Start-Sleep -Seconds 3
+}
+if (-not $dockerReady) { throw 'docker engine did not come up within 2 minutes' }
 docker pull -q mcr.microsoft.com/windows/servercore:ltsc2022
+if ($LASTEXITCODE -ne 0) { throw 'docker pull failed' }
 docker run -d --name fc-win-client mcr.microsoft.com/windows/servercore:ltsc2022 cmd /c ping -t localhost | Out-Null
+if ($LASTEXITCODE -ne 0) { throw 'docker run failed' }
 docker cp $RepoRoot fc-win-client:C:\src
 if ($LASTEXITCODE -ne 0) { throw 'docker cp failed' }
 

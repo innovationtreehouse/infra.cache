@@ -24,6 +24,67 @@ Usage: treehouse-git signin|signout|status
 EOT
 }
 
+# 0 if this login has an unexpired session. Builtins only: the shell hint runs
+# this at every interactive shell start.
+session_live() {
+  local exp now
+  [[ -s "$S/login" && -r "$S/expires" ]] || return 1
+  exp="$(<"$S/expires")"
+  printf -v now '%(%s)T' -1
+  [[ "$exp" =~ ^[0-9]+$ ]] && ((now < 10#$exp))
+}
+
+# Prompts are for members on shared machines only, never root.
+member_on_shared() {
+  shared_machine && [[ "$EUID" -ne 0 ]]
+}
+
+# One line for a new interactive shell. Reads two files; never runs gh.
+cmd_hint() {
+  member_on_shared || return 0
+  if session_live; then
+    local left now
+    printf -v now '%(%s)T' -1
+    left=$(($(<"$S/expires") - now))
+    echo "Signed in to GitHub as $(<"$S/login") ($((left / 3600))h $((left % 3600 / 60))m left)"
+  else
+    echo "Not signed in to GitHub. Run: treehouse-git signin"
+  fi
+}
+
+# Desktop-login autostart entry point: open a terminal running `welcome`, but
+# only when there is something to say. No network until the member says so.
+cmd_welcome_launch() {
+  member_on_shared || return 0
+  session_live && return 0
+  local self="/usr/local/bin/treehouse-git" t
+  [[ -x "$self" ]] || self="$0"
+  for t in gnome-terminal ptyxis kgx konsole xfce4-terminal x-terminal-emulator xterm; do
+    command -v "$t" >/dev/null 2>&1 || continue
+    case "$t" in
+    gnome-terminal | ptyxis | kgx) exec "$t" -- "$self" welcome ;;
+    xfce4-terminal) exec "$t" -x "$self" welcome ;;
+    *) exec "$t" -e "$self" welcome ;;
+    esac
+  done
+  return 0
+}
+
+cmd_welcome() {
+  member_on_shared || return 0
+  session_live && return 0
+  cat <<EOT
+
+  This is a shared computer, and you are not signed in to GitHub.
+  Sign in now so your commits and pushes are made as you. The sign-in ends
+  when you log out, or after $GH_SESSION_HOURS hours. Later: treehouse-git signin
+
+EOT
+  read -r -p "  Press Enter to sign in now, or close this window to skip. " || return 0
+  (cmd_signin) || true
+  read -r -p "  Press Enter to close this window. " || true
+}
+
 # Print session dir $1's gh/hosts.yml. The user owns everything under it and
 # can swap entries at any time, so refuse links, and when root (the sweep) read
 # it as the uid named by the $RUN_BASE/<uid>/ path (logind's, not the user's):
@@ -150,6 +211,10 @@ case "${1:-}" in
 signin) cmd_signin ;;
 signout) cmd_signout ;;
 status) cmd_status ;;
+hint) cmd_hint ;;
+welcome)
+  if [[ "${2:-}" == --launch ]]; then cmd_welcome_launch; else cmd_welcome; fi
+  ;;
 sweep) cmd_sweep ;;
 -h | --help | help)
   usage
