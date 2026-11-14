@@ -28,6 +28,11 @@ from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
 DIST = ROOT / "dist"
+# QR code for https://github.com/login/device, shown by the sign-in window.
+# Pre-generated (the URL never changes), so there is no generator dependency:
+#   qrencode -l M -s 10 -m 4 -o assets/github-login-device-qr.png "https://github.com/login/device"
+# and checked with `zbarimg --raw` (see tests/test_pack_release.py).
+QR_PNG = "assets/github-login-device-qr.png"
 LINUX_FILES = [
     "linux/install.sh",
     "linux/uninstall.sh",
@@ -162,7 +167,7 @@ def main() -> None:
         members(
             prefix,
             version,
-            ["README.md", "defaults.env", "shared.gitconfig"],
+            ["README.md", "defaults.env", "shared.gitconfig", QR_PNG],
             LINUX_FILES,
         ),
         mtime,
@@ -173,7 +178,7 @@ def main() -> None:
         members(
             prefix,
             version,
-            ["README.md", "defaults.json", "shared.gitconfig"],
+            ["README.md", "defaults.json", "shared.gitconfig", QR_PNG],
             WINDOWS_FILES,
         ),
         mtime,

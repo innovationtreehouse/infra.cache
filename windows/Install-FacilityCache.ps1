@@ -58,6 +58,10 @@ $srcDefaults = Join-Path $root 'defaults.json'
 if (Test-Path $srcDefaults) {
     Copy-Item -LiteralPath $srcDefaults -Destination (Join-Path $dest 'defaults.json') -Force
 }
+$srcQr = Join-Path $root 'assets\github-login-device-qr.png'
+if (Test-Path $srcQr) {
+    Copy-Item -LiteralPath $srcQr -Destination (Join-Path $dest 'github-login-device-qr.png') -Force
+}
 $srcShared = Join-Path $root 'shared.gitconfig'
 if (Test-Path $srcShared) {
     Copy-Item -LiteralPath $srcShared -Destination (Join-Path $dest 'shared.gitconfig') -Force

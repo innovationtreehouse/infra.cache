@@ -278,6 +278,7 @@ function Write-FacilityCacheLog {
 function Write-FcHeader {
     param([string]$Title, [string]$Subtitle = '')
     $script:FcCmd = $Title
+    $script:FcStepName = ''
     Write-Host ''
     Write-Host -NoNewline '  '
     Write-Host -NoNewline $Title -ForegroundColor Cyan
@@ -318,13 +319,15 @@ function Write-FcStep {
     $prefix = ''
     if ($script:FcStepN -gt 0) { $prefix = "$($script:FcStepI)/$($script:FcStepN)  " }
     Write-Host "  $($script:FcWork) $prefix$Name  $Message" -ForegroundColor Cyan
+    $script:FcStepName = $Name
     Write-FacilityCacheLog -Event step_start -Message "$Name $Message"
 }
 
 function Write-FcStepOk {
     param([string]$Message = 'done')
     Write-Host "  $($script:FcOk) $Message" -ForegroundColor Green
-    Write-FacilityCacheLog -Event step_ok -Message $Message
+    # Carry the step name, as the Linux log does, so each event reads on its own.
+    Write-FacilityCacheLog -Event step_ok -Message (("$($script:FcStepName) $Message").Trim())
 }
 
 function Write-FcBar {
@@ -1526,7 +1529,7 @@ function Update-FacilityCacheClient {
                 -OwnerId ([string]$meta.owner.id) -Version $remote -Token $token
             if ($why) { throw "build-provenance attestation for $name v${remote} not accepted: $why; refusing to install" }
             $attest = 'verified'
-            Write-FcStepOk $attest
+            Write-FcStepOk "verified  repo id $repoId, owner id $([string]$meta.owner.id), refs/tags/v$remote"
         } else {
             $attest = 'NOT VERIFIED: gh unavailable, sha256 only'
             Write-FcFail "gh could not be installed — installing v$remote WITHOUT build-provenance verification (sha256 only)"

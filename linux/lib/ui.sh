@@ -10,11 +10,12 @@ _UI_N=0
 _UI_I=0
 
 _ui_log_candidates() {
-  printf '%s\n' \
-    /var/log/facility-cache/client.jsonl \
-    /var/lib/facility-cache/logs/client.jsonl \
-    "${XDG_STATE_HOME:-$HOME/.local/state}/facility-cache/client.jsonl" \
-    "/tmp/facility-cache-${USER:-user}.jsonl"
+  printf '%s\n' /var/log/facility-cache/client.jsonl /var/lib/facility-cache/logs/client.jsonl
+  # systemd units run without HOME; scripts sourcing this use set -u.
+  if [[ -n "${XDG_STATE_HOME:-}" || -n "${HOME:-}" ]]; then
+    printf '%s\n' "${XDG_STATE_HOME:-$HOME/.local/state}/facility-cache/client.jsonl"
+  fi
+  printf '%s\n' "/tmp/facility-cache-${USER:-user}.jsonl"
 }
 
 ui_log_path() {
