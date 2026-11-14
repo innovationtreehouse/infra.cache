@@ -1,13 +1,15 @@
 # facility-cache-managed — included from the system gitconfig on shared machines.
 # GitHub credentials come only from the per-login gh session (treehouse-git signin).
+# gh is asked only when the session has a hosts.yml: with none, gh would fall back
+# to a token in the OS keyring left by any earlier `gh auth login` on this account.
 [credential]
 	helper =
 [credential "https://github.com"]
 	helper =
-	helper = !gh auth git-credential
+	helper = "!f() { if [ -s \"${GH_CONFIG_DIR:-/nonexistent}/hosts.yml\" ]; then gh auth git-credential \"$@\"; elif [ \"$1\" = get ]; then echo 'Not signed in to GitHub. Run: treehouse-git signin' >&2; fi; }; f"
 [credential "https://gist.github.com"]
 	helper =
-	helper = !gh auth git-credential
+	helper = "!f() { if [ -s \"${GH_CONFIG_DIR:-/nonexistent}/hosts.yml\" ]; then gh auth git-credential \"$@\"; elif [ \"$1\" = get ]; then echo 'Not signed in to GitHub. Run: treehouse-git signin' >&2; fi; }; f"
 [user]
 	useConfigOnly = true
 [url "https://github.com/"]
