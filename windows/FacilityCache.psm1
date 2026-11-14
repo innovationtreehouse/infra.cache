@@ -192,14 +192,30 @@ function Get-FcTrustedCommand {
     return $null
 }
 
+function Invoke-FcNative {
+    # Every native call from install/apply/update/uninstall goes through here.
+    # Under $ErrorActionPreference = 'Stop' (the scripts' setting, which these
+    # functions see), Windows PowerShell 5.1 turns a native command's redirected
+    # stderr into a terminating NativeCommandError, so one warning line from
+    # git/npm/winget/reg aborted Apply or the installer. Continue is local to
+    # this function; stderr is discarded; callers that care check $LASTEXITCODE.
+    # Usage: Invoke-FcNative <exe> <args...>. No param block on purpose: every
+    # token (including ones like -e) must reach the native command untouched.
+    $ErrorActionPreference = 'Continue'
+    $exe = $args[0]
+    $rest = @($args | Select-Object -Skip 1)
+    & $exe @rest 2>$null
+}
+
 function Invoke-FcSystemGit {
     # git as SYSTEM/admin: never parse a global config (HOME or GIT_CONFIG_GLOBAL)
-    # that someone else could have written.
+    # that someone else could have written. Returns stdout; sets $LASTEXITCODE
+    # (left at 127 when there is no trusted git).
     $git = Get-FcTrustedCommand git
-    if (-not $git) { return }
+    if (-not $git) { $global:LASTEXITCODE = 127; return }
     $prev = $env:GIT_CONFIG_GLOBAL
     $env:GIT_CONFIG_GLOBAL = '/dev/null'
-    try { & $git @args } finally { $env:GIT_CONFIG_GLOBAL = $prev }
+    try { Invoke-FcNative $git @args } finally { $env:GIT_CONFIG_GLOBAL = $prev }
 }
 
 function New-FcGitHubHeaders {
@@ -718,16 +734,16 @@ allow-insecure-host = ["$($cfg.CacheHost)"]
     if ($npmOn) {
         Set-MachineEnv -Name 'NPM_CONFIG_REGISTRY' -Value $npm
         if ($npmCmd) {
-            & $npmCmd config set registry $npm --location=global 2>$null
+            Invoke-FcNative $npmCmd config set registry $npm --location=global | Out-Null
         }
     } else {
         Set-MachineEnv -Name 'NPM_CONFIG_REGISTRY' -Value $null
         if ($npmCmd) {
             # Only clear the global registry if it's still pointed at ours — never
             # blow away a registry someone else configured.
-            $currentRegistry = (& $npmCmd config get registry --location=global 2>$null)
-            if ($currentRegistry -and $currentRegistry.Trim() -eq $npm) {
-                & $npmCmd config delete registry --location=global 2>$null
+            $currentRegistry = (Invoke-FcNative $npmCmd config get registry --location=global)
+            if ($currentRegistry -and ([string]$currentRegistry).Trim() -eq $npm) {
+                Invoke-FcNative $npmCmd config delete registry --location=global | Out-Null
             }
         }
     }
@@ -872,7 +888,7 @@ function Set-TreehouseGitUserEnv {
             $hive = Join-Path $p.Dir 'NTUSER.DAT'
             if (-not $IncludeUnloaded -or -not (Test-Path -LiteralPath $hive)) { continue }
             $root = 'facility-cache-' + [guid]::NewGuid().ToString('N')
-            & $reg load "HKU\$root" $hive 2>$null | Out-Null
+            Invoke-FcNative $reg load "HKU\$root" $hive | Out-Null
             if ($LASTEXITCODE -ne 0) { continue }
             $mounted = $true
         }
@@ -897,7 +913,7 @@ function Set-TreehouseGitUserEnv {
         } finally {
             if ($mounted) {
                 [GC]::Collect(); [GC]::WaitForPendingFinalizers()
-                & $reg unload "HKU\$root" 2>$null | Out-Null
+                Invoke-FcNative $reg unload "HKU\$root" | Out-Null
             }
         }
     }
@@ -909,8 +925,9 @@ function Disable-TreehouseGitSharedMachine {
     param([switch]$IncludeUnloaded)
     Set-TreehouseGitUserEnv -Remove -IncludeUnloaded:$IncludeUnloaded
     $include = (Join-Path (Get-FacilityCacheInstallDir) 'shared.gitconfig').Replace('\', '/')
-    if (@(Invoke-FcSystemGit config --system --get-all include.path 2>$null) -contains $include) {
-        Invoke-FcSystemGit config --system --fixed-value --unset-all include.path $include
+    if (@(Invoke-FcSystemGit config --system --get-all include.path) -contains $include) {
+        Invoke-FcSystemGit config --system --fixed-value --unset-all include.path $include | Out-Null
+        if ($LASTEXITCODE -ne 0) { Write-FcWarn "git: could not remove the shared.gitconfig include (exit $LASTEXITCODE)" }
     }
     [void](Reset-TreehouseGitSession)
 }
@@ -932,8 +949,10 @@ function Set-TreehouseGitSharedMachine {
     [void](Reset-TreehouseGitSession -OnlyIfExpired)
     Set-TreehouseGitUserEnv
     $include = (Join-Path (Get-FacilityCacheInstallDir) 'shared.gitconfig').Replace('\', '/')
-    if (@(Invoke-FcSystemGit config --system --get-all include.path 2>$null) -notcontains $include) {
-        Invoke-FcSystemGit config --system --add include.path $include
+    if (@(Invoke-FcSystemGit config --system --get-all include.path) -notcontains $include) {
+        Invoke-FcSystemGit config --system --add include.path $include | Out-Null
+        # 127 = no trusted git: the installer warns about that once; don't log it every 5 minutes.
+        if ($LASTEXITCODE -ne 0 -and $LASTEXITCODE -ne 127) { Write-FcWarn "git: could not add the shared.gitconfig include (exit $LASTEXITCODE)" }
     }
 }
 
@@ -972,7 +991,8 @@ function Start-TreehouseGitSession {
     Write-Host '    2. Enter the one-time code shown below and approve'
     Write-Host '  Do not sign in to GitHub in this computer''s browser.' -ForegroundColor Yellow
     Write-Host ''
-    & gh auth login --hostname github.com --git-protocol https --web --insecure-storage --skip-ssh-key | Out-Host
+    # Not redirected (gh prints the device code on stderr); Continue so 5.1 can't turn it into an error.
+    & { $ErrorActionPreference = 'Continue'; & gh auth login --hostname github.com --git-protocol https --web --insecure-storage --skip-ssh-key | Out-Host }
     if ($LASTEXITCODE -ne 0) {
         [void](Reset-TreehouseGitSession)
         Write-FcFail 'GitHub sign-in did not complete'
@@ -983,7 +1003,7 @@ function Start-TreehouseGitSession {
     $prevEnc = [Console]::OutputEncoding
     try {
         [Console]::OutputEncoding = [Text.Encoding]::UTF8
-        $info = & gh api user --jq '[.login, .id, (.name // .login)] | @tsv'
+        $info = & { $ErrorActionPreference = 'Continue'; & gh api user --jq '[.login, .id, (.name // .login)] | @tsv' }
     } finally {
         [Console]::OutputEncoding = $prevEnc
     }
@@ -996,8 +1016,13 @@ function Start-TreehouseGitSession {
     $login = $f[0]
     $name = $login
     if ($f.Count -ge 3 -and $f[2].Trim()) { $name = $f[2].Trim() }
-    & git config --global user.name $name
-    & git config --global user.email "$($f[1])+$login@users.noreply.github.com"
+    Invoke-FcNative git config --global user.name $name
+    Invoke-FcNative git config --global user.email "$($f[1])+$login@users.noreply.github.com"
+    if ($LASTEXITCODE -ne 0) {
+        [void](Reset-TreehouseGitSession)
+        Write-FcFail 'could not write your git identity'
+        return $false
+    }
     Set-Content -LiteralPath (Join-Path $d 'login') -Value $login -Encoding ASCII
     Write-FcOk "signed in to GitHub as $login ($name)"
     Write-FcNote "until $([DateTimeOffset]::FromUnixTimeSeconds($expires).LocalDateTime.ToString('ddd HH:mm')), or until you log off or run: treehouse-git signout"
@@ -1075,9 +1100,9 @@ function Sync-FacilityCacheGitHubCli {
         $wgArgs = @('--accept-package-agreements', '--accept-source-agreements')
         try {
             if ($gh) {
-                & $winget upgrade --id GitHub.cli @wgArgs 2>$null | Out-Null
+                Invoke-FcNative $winget upgrade --id GitHub.cli @wgArgs | Out-Null
             } else {
-                & $winget install --id GitHub.cli -e --source winget @wgArgs 2>$null | Out-Null
+                Invoke-FcNative $winget install --id GitHub.cli -e --source winget @wgArgs | Out-Null
             }
         } catch { }
         Update-GitHubCliPath
