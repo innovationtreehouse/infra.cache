@@ -49,7 +49,7 @@ function Install-BootGitHubCli([string]$Dir) {
     try {
         $winget = Find-BootTool winget
         if ($winget) {
-            & $winget install --id GitHub.cli -e --source winget --accept-package-agreements --accept-source-agreements 2>$null | Out-Null
+            & { $ErrorActionPreference = 'Continue'; & $winget install --id GitHub.cli -e --source winget --accept-package-agreements --accept-source-agreements 2>$null | Out-Null }
         }
         $env:Path = [Environment]::GetEnvironmentVariable('Path', 'Machine') + ";$env:ProgramFiles\GitHub CLI;$env:Path"
         if (Find-BootTool gh) { return }

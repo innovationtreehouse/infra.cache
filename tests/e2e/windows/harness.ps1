@@ -207,6 +207,26 @@ Write-FcConfig @{ SharedMachine = $true }
 & powershell.exe -NoProfile -ExecutionPolicy Bypass -File $apply
 New-Item -ItemType Directory -Force -Path $sess | Out-Null
 
+Section 'T7b install from a plain tree (no VERSION, not a checkout) with git on PATH'
+# git describe writes "fatal: not a git repository" to stderr; under Stop on PS 5.1
+# that used to abort the installer (NativeCommandError). A stub git reproduces it
+# whether or not the runner has git.
+$plain = Join-Path $env:TEMP 'fc-e2e-plain-tree'
+$stub = Join-Path $env:TEMP 'fc-e2e-git-stub'
+& robocopy.exe $RepoRoot $plain /E /XD .git /NFL /NDL /NJH /NJS /NP | Out-Null
+Remove-Item -LiteralPath (Join-Path $plain 'VERSION') -Force -ErrorAction SilentlyContinue
+New-Item -ItemType Directory -Force -Path $stub | Out-Null
+"@echo fatal: not a git repository 1>&2`r`n@exit /b 128" | Set-Content (Join-Path $stub 'git.cmd') -Encoding ASCII
+$oldPath = $env:Path
+$env:Path = "$stub;$env:Path"
+& powershell.exe -NoProfile -ExecutionPolicy Bypass -File (Join-Path $plain 'windows\Install-FacilityCache.ps1') -NoRestartDocker -NoDocker
+$plainExit = $LASTEXITCODE
+$env:Path = $oldPath
+$plainVer = (Get-Content (Join-Path $fcDir 'VERSION') -Raw).Trim()
+Check 'install from plain tree with failing git: exit 0, VERSION 0.0.0-dev' ($plainExit -eq 0 -and $plainVer -eq '0.0.0-dev') "exit=$plainExit version=$plainVer"
+Remove-Item -LiteralPath $plain, $stub -Recurse -Force -ErrorAction SilentlyContinue
+New-Item -ItemType Directory -Force -Path $sess | Out-Null
+
 Section 'T8 uninstall'
 & powershell.exe -NoProfile -ExecutionPolicy Bypass -File (Join-Path $env:ProgramData 'FacilityCache\Uninstall-FacilityCache.ps1')
 Check 'uninstall exit 0' ($LASTEXITCODE -eq 0)

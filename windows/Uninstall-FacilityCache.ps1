@@ -77,9 +77,13 @@ if ($npmCmd) {
         $fcCfg = Get-FacilityCacheConfig
         $npmRegistry = "http://$($fcCfg.CacheHost):$($fcCfg.NpmPort)/"
     }
-    $currentRegistry = (& npm config get registry --location=global 2>$null)
-    if ($npmRegistry -and $currentRegistry -and $currentRegistry.Trim() -eq $npmRegistry) {
-        & npm config delete registry --location=global 2>$null
+    # Continue in a child scope: npm warnings on stderr must not abort uninstall under Stop (PS 5.1).
+    & {
+        $ErrorActionPreference = 'Continue'
+        $currentRegistry = (& npm config get registry --location=global 2>$null)
+        if ($npmRegistry -and $currentRegistry -and ([string]$currentRegistry).Trim() -eq $npmRegistry) {
+            & npm config delete registry --location=global 2>$null
+        }
     }
 }
 

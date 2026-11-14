@@ -8,7 +8,7 @@ $script:DefaultConfig = @{
     NpmPort          = 4873
     DockerHubPort    = 5000
     DockerGhcrPort   = 5001
-    ProbeTimeoutMs   = 1000
+    ProbeTimeoutMs   = 5000
     # Display only: updates resolve the current name from GitHubRepoId.
     GitHubRepo       = 'innovationtreehouse/infra.cache'
     GitHubRepoId     = 1343160243
@@ -455,7 +455,7 @@ function Test-FacilityCachePort {
     param(
         [Parameter(Mandatory = $true)][string]$Ip,
         [Parameter(Mandatory = $true)][int]$Port,
-        [int]$TimeoutMs = 1000
+        [int]$TimeoutMs = 5000
     )
     $client = New-Object System.Net.Sockets.TcpClient
     try {

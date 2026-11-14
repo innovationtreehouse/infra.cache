@@ -28,7 +28,9 @@ $ver = '0.0.0-dev'
 if (Test-Path $verFile) {
     $ver = (Get-Content $verFile -Raw).Trim().TrimStart('v')
 } elseif (Get-Command git -ErrorAction SilentlyContinue) {
-    $described = (& git -C $root describe --tags --match 'v*' --dirty 2>$null)
+    # Child scope with Continue: under Stop, PS 5.1 turns a native command's
+    # redirected stderr ("fatal: not a git repository") into a terminating error.
+    $described = & { $ErrorActionPreference = 'Continue'; & git -C $root describe --tags --match 'v*' --dirty 2>$null }
     if ($LASTEXITCODE -eq 0 -and $described) { $ver = ([string]$described).Trim().TrimStart('v') }
 }
 # Before anything (even the log) touches it: SYSTEM tasks run code and read
