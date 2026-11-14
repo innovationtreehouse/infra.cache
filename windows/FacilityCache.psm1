@@ -48,10 +48,18 @@ function Test-FcLink {
     return [bool]($Item.Attributes -band [IO.FileAttributes]::ReparsePoint)
 }
 
-function Remove-FcLink {
-    # Deletes a junction/symlink itself, never its target.
+function Test-FcDir {
+    # By attribute: raw .NET FileSystemInfo objects (GetFileSystemInfos) have no PSIsContainer.
     param($Item)
-    if ($Item.PSIsContainer) { [IO.Directory]::Delete($Item.FullName, $false) } else { [IO.File]::Delete($Item.FullName) }
+    return [bool]($Item.Attributes -band [IO.FileAttributes]::Directory)
+}
+
+function Remove-FcLink {
+    # Deletes a junction/symlink itself, never its target. A directory link
+    # needs the non-recursive Directory.Delete; File.Delete on it is access denied.
+    param($Item)
+    if ($Item.Attributes -band [IO.FileAttributes]::ReadOnly) { $Item.Attributes = $Item.Attributes -band -bnot [IO.FileAttributes]::ReadOnly }
+    if (Test-FcDir $Item) { [IO.Directory]::Delete($Item.FullName, $false) } else { [IO.File]::Delete($Item.FullName) }
 }
 
 function Get-FcTrustedOwnerSids {
@@ -119,14 +127,14 @@ function Protect-FcTree {
                 [IO.File]::Move($p, $aside)
                 [void]$Notes.Add("$p was not created by an administrator; ignored and moved to $aside")
             } else {
-                if ($c.PSIsContainer) { [IO.Directory]::Delete($p, $true) } else { [IO.File]::Delete($p) }
+                if (Test-FcDir $c) { [IO.Directory]::Delete($p, $true) } else { $c.Attributes = 'Normal'; [IO.File]::Delete($p) }
                 [void]$Notes.Add("removed $p (not created by an administrator)")
             }
             continue
         }
         $secret = ($c.Name -eq 'github-token')
         Set-FcAcl -Path $p -Protect:$secret -NoUsers:$secret
-        if ($c.PSIsContainer) { Protect-FcTree -Dir $p -Trusted $Trusted -Notes $Notes }
+        if (Test-FcDir $c) { Protect-FcTree -Dir $p -Trusted $Trusted -Notes $Notes }
     }
 }
 
