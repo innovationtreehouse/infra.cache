@@ -264,7 +264,9 @@ function Write-FacilityCacheLog {
     }
     try {
         $path = Get-FacilityCacheLogPath
-        ($rec | ConvertTo-Json -Compress -Depth 6) | Add-Content -LiteralPath $path -Encoding UTF8
+        # -ErrorAction Stop so the catch below sees it: members (treehouse-git) cannot
+        # write the admin-only log, and must not get an error printed for that.
+        ($rec | ConvertTo-Json -Compress -Depth 6) | Add-Content -LiteralPath $path -Encoding UTF8 -ErrorAction Stop
         if ((Get-Item $path).Length -gt 2000000) {
             $bak = "$path.1"
             if (Test-Path $bak) { Remove-Item $bak -Force }
