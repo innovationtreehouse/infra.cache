@@ -4,8 +4,8 @@ linux/sbin/facility-cache-update.
 These are the functions that turn a downloaded release archive's sha256
 into a Sigstore bundle fetched from the PUBLIC (no-auth) GitHub attestations
 API, and then verify that bundle offline with `gh attestation verify
---bundle`. Both must never raise (the caller only ever warns and falls back
-to sha256), so most of this file is failure-mode coverage.
+--bundle`, plus the id-based certificate policy applied to gh's JSON. None
+of them may raise; any doubt must come back as a failure.
 """
 
 from __future__ import annotations
@@ -173,6 +173,92 @@ class TestFetchAttestationBundles(unittest.TestCase):
         self.assertIsNone(result)
 
 
+ID, OWNER_ID, VER = "1343160243", "166767539", "1.0.3"
+
+
+def _cert(**over):
+    """The certificate gh 2.104 reports for the real v1.0.3 release, which was
+    signed before the rename (old name, same numeric ids)."""
+    old = "https://github.com/innovationtreehouse/cache"
+    cert = {
+        "sourceRepositoryURI": old,
+        "sourceRepositoryIdentifier": ID,
+        "sourceRepositoryOwnerURI": "https://github.com/innovationtreehouse",
+        "sourceRepositoryOwnerIdentifier": OWNER_ID,
+        "sourceRepositoryRef": "refs/tags/v1.0.3",
+        "buildSignerURI": f"{old}/.github/workflows/release.yml@refs/tags/v1.0.3",
+        "runnerEnvironment": "github-hosted",
+    }
+    cert.update(over)
+    return [{"verificationResult": {"signature": {"certificate": cert}}}]
+
+
+class TestAttestationPolicy(unittest.TestCase):
+    def check(self, results, repo_id=ID, owner_id=OWNER_ID, version=VER):
+        return update.attestation_policy_failure(results, repo_id, owner_id, version)
+
+    def test_pre_rename_release_of_the_pinned_repo_verifies(self):
+        self.assertEqual(self.check(_cert()), "")
+
+    def test_post_rename_name_verifies_too(self):
+        new = "https://github.com/innovationtreehouse/infra.cache"
+        results = _cert(
+            sourceRepositoryURI=new,
+            buildSignerURI=f"{new}/.github/workflows/release.yml@refs/tags/v1.0.3",
+        )
+        self.assertEqual(self.check(results), "")
+
+    def test_a_different_repo_under_our_name_is_refused(self):
+        self.assertIn("repo id", self.check(_cert(sourceRepositoryIdentifier="999")))
+
+    def test_a_different_owner_is_refused(self):
+        self.assertIn(
+            "owner id", self.check(_cert(sourceRepositoryOwnerIdentifier="1"))
+        )
+
+    def test_wrong_version_tag_is_refused(self):
+        self.assertIn("source ref", self.check(_cert(), version="1.0.4"))
+
+    def test_branch_build_is_refused(self):
+        old = "https://github.com/innovationtreehouse/cache"
+        results = _cert(
+            sourceRepositoryRef="refs/heads/evil",
+            buildSignerURI=f"{old}/.github/workflows/release.yml@refs/heads/evil",
+        )
+        self.assertNotEqual(self.check(results), "")
+
+    def test_other_workflow_is_refused(self):
+        old = "https://github.com/innovationtreehouse/cache"
+        results = _cert(
+            buildSignerURI=f"{old}/.github/workflows/ci.yml@refs/tags/v1.0.3"
+        )
+        self.assertIn("signer", self.check(results))
+
+    def test_signer_in_another_repo_is_refused(self):
+        results = _cert(
+            buildSignerURI="https://github.com/evil/x/.github/workflows/release.yml@refs/tags/v1.0.3"
+        )
+        self.assertIn("signer", self.check(results))
+
+    def test_self_hosted_runner_is_refused(self):
+        self.assertIn("runner", self.check(_cert(runnerEnvironment="self-hosted")))
+
+    def test_missing_id_field_fails_closed(self):
+        results = _cert()
+        del results[0]["verificationResult"]["signature"]["certificate"][
+            "sourceRepositoryIdentifier"
+        ]
+        self.assertIn("gh too old", self.check(results))
+
+    def test_empty_or_garbage_output_fails(self):
+        for bad in ([], {}, None, [{"x": 1}]):
+            self.assertNotEqual(self.check(bad), "")
+
+    def test_no_pin_fails(self):
+        self.assertNotEqual(self.check(_cert(), repo_id=""), "")
+        self.assertNotEqual(self.check(_cert(), owner_id=""), "")
+
+
 class TestVerifyAttestation(unittest.TestCase):
     def setUp(self):
         self._tmp = tempfile.NamedTemporaryFile(delete=False)
@@ -183,86 +269,88 @@ class TestVerifyAttestation(unittest.TestCase):
     def tearDown(self):
         self.tar_path.unlink(missing_ok=True)
 
-    def test_returns_false_when_gh_missing(self):
-        with mock.patch("shutil.which", return_value=None):
-            result = update.verify_attestation(self.tar_path, REPO, "")
-        self.assertFalse(result)
+    def verify(self):
+        return update.verify_attestation(self.tar_path, REPO, "", ID, OWNER_ID, VER)
 
-    def test_returns_false_when_no_bundles_fetched(self):
+    def run_with(self, fake_run, bundles=({"n": 1},)):
+        with (
+            mock.patch("shutil.which", return_value="/usr/bin/gh"),
+            mock.patch.object(
+                update, "fetch_attestation_bundles", return_value=list(bundles)
+            ),
+            mock.patch("subprocess.run", side_effect=fake_run),
+        ):
+            return self.verify()
+
+    def test_fails_when_gh_missing(self):
+        with mock.patch("shutil.which", return_value=None):
+            self.assertNotEqual(self.verify(), "")
+
+    def test_fails_when_no_bundles_fetched(self):
         with (
             mock.patch("shutil.which", return_value="/usr/bin/gh"),
             mock.patch.object(update, "fetch_attestation_bundles", return_value=None),
         ):
-            result = update.verify_attestation(self.tar_path, REPO, "")
-        self.assertFalse(result)
+            self.assertNotEqual(self.verify(), "")
 
     def test_temp_file_removed_even_when_subprocess_raises(self):
-        captured_path = {}
+        captured = {}
 
         def fake_run(cmd, **kwargs):
-            idx = cmd.index("--bundle")
-            captured_path["path"] = cmd[idx + 1]
-            raise subprocess.CalledProcessError(1, cmd)
+            captured["path"] = cmd[cmd.index("--bundle") + 1]
+            raise OSError("boom")
 
-        with (
-            mock.patch("shutil.which", return_value="/usr/bin/gh"),
-            mock.patch.object(
-                update,
-                "fetch_attestation_bundles",
-                return_value=[{"n": 1}],
-            ),
-            mock.patch("subprocess.run", side_effect=fake_run),
-        ):
-            result = update.verify_attestation(self.tar_path, REPO, "")
-        self.assertFalse(result)
-        self.assertIn("path", captured_path)
-        self.assertFalse(Path(captured_path["path"]).exists())
+        self.assertNotEqual(self.run_with(fake_run), "")
+        self.assertFalse(Path(captured["path"]).exists())
 
-    def test_argv_contains_bundle_and_signer_workflow_and_deny_self_hosted(self):
-        captured_cmd = {}
+    def test_argv_enforces_owner_tag_ref_runner_and_json(self):
+        captured = {}
 
         def fake_run(cmd, **kwargs):
-            captured_cmd["cmd"] = cmd
-            return subprocess.CompletedProcess(cmd, 0)
+            captured["cmd"] = cmd
+            return subprocess.CompletedProcess(cmd, 0, json.dumps(_cert()), "")
 
-        with (
-            mock.patch("shutil.which", return_value="/usr/bin/gh"),
-            mock.patch.object(
-                update,
-                "fetch_attestation_bundles",
-                return_value=[{"n": 1}],
-            ),
-            mock.patch("subprocess.run", side_effect=fake_run),
-        ):
-            result = update.verify_attestation(self.tar_path, REPO, "")
-        self.assertTrue(result)
-        cmd = captured_cmd["cmd"]
-        self.assertIn("--bundle", cmd)
+        self.assertEqual(self.run_with(fake_run), "")
+        cmd = captured["cmd"]
+        self.assertEqual(cmd[cmd.index("--owner") + 1], "innovationtreehouse")
+        self.assertEqual(cmd[cmd.index("--source-ref") + 1], "refs/tags/v1.0.3")
+        self.assertEqual(cmd[cmd.index("--format") + 1], "json")
         self.assertIn("--deny-self-hosted-runners", cmd)
-        idx = cmd.index("--signer-workflow")
-        self.assertEqual(cmd[idx + 1], f"{REPO}/.github/workflows/release.yml")
+        self.assertNotIn("--repo", cmd)  # name-based; ids are checked instead
+
+    def test_policy_failure_on_gh_success_is_a_failure(self):
+        def fake_run(cmd, **kwargs):
+            out = json.dumps(_cert(sourceRepositoryIdentifier="999"))
+            return subprocess.CompletedProcess(cmd, 0, out, "")
+
+        self.assertIn("repo id", self.run_with(fake_run))
+
+    def test_gh_nonzero_is_a_failure(self):
+        def fake_run(cmd, **kwargs):
+            return subprocess.CompletedProcess(cmd, 1, "", "Error: bad sig\n")
+
+        self.assertIn("bad sig", self.run_with(fake_run))
+
+    def test_gh_without_source_ref_flag_says_too_old(self):
+        def fake_run(cmd, **kwargs):
+            return subprocess.CompletedProcess(
+                cmd, 1, "", "unknown flag: --source-ref\n"
+            )
+
+        self.assertIn("too old", self.run_with(fake_run))
 
     def test_all_bundles_written_as_jsonl_lines(self):
         bundles = [{"n": 1}, {"n": 2}, {"n": 3}, {"n": 4}]
-        captured_content = {}
+        captured = {}
 
         def fake_run(cmd, **kwargs):
-            idx = cmd.index("--bundle")
-            captured_content["text"] = Path(cmd[idx + 1]).read_text(encoding="utf-8")
-            return subprocess.CompletedProcess(cmd, 0)
+            captured["text"] = Path(cmd[cmd.index("--bundle") + 1]).read_text(
+                encoding="utf-8"
+            )
+            return subprocess.CompletedProcess(cmd, 0, json.dumps(_cert()), "")
 
-        with (
-            mock.patch("shutil.which", return_value="/usr/bin/gh"),
-            mock.patch.object(
-                update, "fetch_attestation_bundles", return_value=bundles
-            ),
-            mock.patch("subprocess.run", side_effect=fake_run),
-        ):
-            result = update.verify_attestation(self.tar_path, REPO, "")
-        self.assertTrue(result)
-        lines = captured_content["text"].splitlines()
-        self.assertEqual(len(lines), len(bundles))
-        parsed = [json.loads(line) for line in lines]
+        self.assertEqual(self.run_with(fake_run, bundles), "")
+        parsed = [json.loads(line) for line in captured["text"].splitlines()]
         self.assertEqual(parsed, bundles)
 
 

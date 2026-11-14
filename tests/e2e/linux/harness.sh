@@ -208,7 +208,8 @@ ck "repo-id pin mismatch refuses (negative)" $? "$(grep -iEo 'refus[^\"]*|mismat
 write_config
 facility-cache update >/tmp/upfull 2>&1
 ck "full update exit 0" $? "$(tail -2 /tmp/upfull | head -1)"
-grep -Eq "verified" /tmp/upfull
+# Success line only ("attest  verified  repo id …"); a refusal reads "attest  <reason>".
+grep -Eq "attest +verified +repo id 1343160243, refs/tags/v" /tmp/upfull && ! grep -q "refusing to install" /tmp/upfull
 ck "attestation VERIFIED (no gh login)" $? "$(grep -E 'attest|verified|sha256 only' /tmp/upfull | tail -1)"
 V="$(cat /usr/local/lib/facility-cache/VERSION)"
 [ "$V" != "1.0.0" ]

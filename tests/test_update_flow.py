@@ -43,9 +43,9 @@ class TestUpdateFlow(unittest.TestCase):
         os.environ["FACILITY_CACHE_LOG"] = str(var / "log.jsonl")
         self.installed = []
         self.cfg = {"GITHUB_REPO": "innovationtreehouse/cache", "GITHUB_REPO_ID": "7"}
-        self.meta = {"id": 7, "full_name": NEW_NAME}
+        self.meta = {"id": 7, "full_name": NEW_NAME, "owner": {"id": 42}}
         self.gh = "/usr/bin/gh"
-        self.attest = mock.Mock(return_value=True)
+        self.attest = mock.Mock(return_value="")
 
         def fake_download(_urlopen, _req, dest, *_a, **_k):
             dest.write_bytes(TARBALL)
@@ -113,14 +113,16 @@ class TestUpdateFlow(unittest.TestCase):
         self.assertEqual(self.last_result(), "updated")
         args = self.attest.call_args.args
         self.assertEqual(args[1], NEW_NAME)  # not the configured pre-rename name
-        self.assertEqual(args[3], "7")
+        # ids from the pin and the pinned repo's owner, version from the release
+        self.assertEqual(args[3:], ("7", "42", "9.9.9"))
         update.latest_release.assert_called_with(mock.ANY, NEW_NAME)
 
     def test_failed_attestation_with_gh_is_fatal(self):
-        self.attest.return_value = False
+        self.attest.return_value = "certificate repo id mismatch"
         self.assertEqual(update.main(), 1)
         self.assertEqual(self.installed, [])
         self.assertIn("refused: attestation", self.last_result())
+        self.assertIn("repo id mismatch", self.last_result())
 
     def test_without_gh_installs_on_sha256_only_and_says_so(self):
         self.gh = None

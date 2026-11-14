@@ -69,6 +69,7 @@ fi
 # Only the pinned repository's current name is used from here on: releases
 # and attestations (signed under the post-rename name) are checked against it.
 REPO="$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["full_name"])' "$TMP/repo.json")"
+OWNER_ID="$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["owner"]["id"])' "$TMP/repo.json")"
 ok "repo id ${REPO_ID}  ${REPO}"
 API="https://api.github.com/repos/${REPO}/releases/latest"
 if ! curl -fsSL "${AUTH[@]}" -H "User-Agent: facility-cache-client-bootstrap" \
@@ -221,17 +222,45 @@ fi
 # for a public repo, which a fresh install never has. The python3 step above
 # already fetched the Sigstore bundle(s) from the PUBLIC (no-auth)
 # attestations API and wrote them as $TMP/bundle.jsonl, so verify offline
-# with --bundle instead — that genuinely needs no login. With gh present a
-# missing or failing attestation is fatal.
-if command -v gh >/dev/null 2>&1; then
-  if [[ -s "$TMP/bundle.jsonl" ]] && gh attestation verify "$TMP/$NAME" \
-    --repo "$REPO" \
+# with --bundle instead — that genuinely needs no login. gh does the
+# cryptography, org, tag ref and runner checks; the python below requires the
+# certificate's numeric repo and owner ids (never names, so a rename cannot
+# break or fake it) and release.yml of that repo at that tag as the signer.
+# Same rule as attestation_policy_failure in facility-cache-update; duplicated
+# because the updater is in the tarball under test. Any missing field fails.
+bootstrap_attest() {
+  [[ -s "$TMP/bundle.jsonl" && -n "$VER" ]] || return 1
+  gh attestation verify "$TMP/$NAME" \
+    --owner "${REPO%%/*}" \
     --bundle "$TMP/bundle.jsonl" \
-    --signer-workflow "${REPO}/.github/workflows/release.yml" \
-    --deny-self-hosted-runners >/dev/null 2>&1; then
-    ok "attested  ${NAME}"
+    --source-ref "refs/tags/v${VER}" \
+    --deny-self-hosted-runners \
+    --format json >"$TMP/verify.json" 2>"$TMP/verify.err" || {
+    tail -n1 "$TMP/verify.err" >&2
+    return 1
+  }
+  python3 - "$TMP/verify.json" "$REPO_ID" "$OWNER_ID" "refs/tags/v${VER}" <<'PY'
+import json, sys
+results, repo_id, owner_id, ref = json.load(open(sys.argv[1])), *sys.argv[2:]
+for res in results if isinstance(results, list) else []:
+    try:
+        c = res["verificationResult"]["signature"]["certificate"]
+        src = c["sourceRepositoryURI"]
+        got = [c["sourceRepositoryIdentifier"], c["sourceRepositoryOwnerIdentifier"],
+               c["sourceRepositoryRef"], c["buildSignerURI"], c["runnerEnvironment"]]
+    except (KeyError, TypeError):
+        continue
+    want = [repo_id, owner_id, ref, f"{src}/.github/workflows/release.yml@{ref}", "github-hosted"]
+    if owner_id and [str(g) for g in got] == want and src.startswith("https://github.com/"):
+        sys.exit(0)
+sys.exit("certificate repo id / owner id / signer / ref do not match")
+PY
+}
+if command -v gh >/dev/null 2>&1; then
+  if bootstrap_attest; then
+    ok "attested  ${NAME}  repo id ${REPO_ID}, refs/tags/v${VER}"
   else
-    fail "attestation missing or invalid for ${NAME} (${REPO} release.yml) — refusing to install"
+    fail "attestation missing or invalid for ${NAME} — refusing to install"
     exit 1
   fi
 else

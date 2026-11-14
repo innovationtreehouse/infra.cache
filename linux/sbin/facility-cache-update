@@ -239,30 +239,72 @@ def fetch_attestation_bundles(
         return None
 
 
-def verify_attestation(
-    tar_path: Path, repo: str, token: str, repo_id: str = ""
-) -> bool:
-    """GitHub Artifact Attestation check. Never raises; False on any failure.
+def attestation_policy_failure(
+    results: object, repo_id: str, owner_id: str, version: str
+) -> str:
+    """Why none of `gh attestation verify --format json` results is ours; "".
 
-    repo must be the full_name resolved AFTER the numeric repo-id pin matched.
-    The caller refuses to install on False whenever `gh` is available; only a
-    machine where gh cannot be installed falls back (loudly) to sha256.
+    Identity is checked by immutable numeric ids, never by name, so a release
+    signed before or after a rename verifies, and no other repository can,
+    whatever it is called. The signer must be release.yml in that same repo,
+    run from the tag of the version being installed (not a branch that could
+    edit release.yml). Any missing or unexpected field fails.
+    """
+    if not repo_id or not owner_id or not version:
+        return "no pinned repo id / owner id / version to check against"
+    ref = f"refs/tags/v{version}"
+    if not isinstance(results, list) or not results:
+        return "gh returned no verification results"
+    reason = "no attestation matched"
+    for res in results:
+        try:
+            cert = res["verificationResult"]["signature"]["certificate"]
+            src = cert["sourceRepositoryURI"]
+            checks = {
+                "repo id": (cert["sourceRepositoryIdentifier"], repo_id),
+                "owner id": (cert["sourceRepositoryOwnerIdentifier"], owner_id),
+                "source ref": (cert["sourceRepositoryRef"], ref),
+                "signer": (
+                    cert["buildSignerURI"],
+                    f"{src}/.github/workflows/release.yml@{ref}",
+                ),
+                "runner": (cert["runnerEnvironment"], "github-hosted"),
+            }
+        except (KeyError, TypeError):
+            reason = "certificate lacks repo/owner id fields (gh too old?)"
+            continue
+        bad = [k for k, (got, want) in checks.items() if str(got) != str(want)]
+        if not bad and src.startswith("https://github.com/"):
+            return ""
+        reason = "certificate " + ", ".join(bad or ["source"]) + " mismatch"
+    return reason
+
+
+def verify_attestation(
+    tar_path: Path,
+    repo: str,
+    token: str,
+    repo_id: str,
+    owner_id: str,
+    version: str,
+) -> str:
+    """GitHub Artifact Attestation check. Never raises. Returns "" when
+    verified, else the reason it is not.
 
     The bundle(s) are fetched with no credentials (see
-    fetch_attestation_bundles) and verified fully offline via --bundle, so
-    `gh auth login` is never required. All matching attestations are written
-    out as JSON Lines (one bundle object per line) and passed to a single
-    `gh attestation verify --bundle` call, which accepts that form. Pins
-    --signer-workflow to this repo's release.yml so a different workflow
-    with attestations:write cannot satisfy the check, and
-    --deny-self-hosted-runners so only GitHub-hosted runners count.
+    fetch_attestation_bundles; repo is only the API path, resolved after the
+    id pin) and verified offline via --bundle, so `gh auth login` is never
+    required. gh does the cryptography and enforces the org (--owner), the
+    tag ref (--source-ref) and GitHub-hosted runners; the numeric repo/owner
+    ids and the signer workflow are checked on its JSON output (see
+    attestation_policy_failure), since gh only matches those by name.
     """
     gh = shutil.which("gh")
     if not gh:
-        return False
+        return "gh not installed"
     bundles = fetch_attestation_bundles(tar_path, repo, token, repo_id)
     if not bundles:
-        return False
+        return "no attestation found for this file"
     bundle_path = ""
     try:
         with tempfile.NamedTemporaryFile(
@@ -271,34 +313,37 @@ def verify_attestation(
             bundle_path = fh.name
             for bundle in bundles:
                 fh.write(json.dumps(bundle) + "\n")
-        subprocess.run(
+        proc = subprocess.run(
             [
                 gh,
                 "attestation",
                 "verify",
                 str(tar_path),
-                "--repo",
-                repo,
+                "--owner",
+                repo.split("/", 1)[0],
                 "--bundle",
                 bundle_path,
-                "--signer-workflow",
-                f"{repo}/.github/workflows/release.yml",
+                "--source-ref",
+                f"refs/tags/v{version}",
                 "--deny-self-hosted-runners",
+                "--format",
+                "json",
             ],
-            check=True,
+            check=False,
             capture_output=True,
             text=True,
             timeout=30,
         )
-        return True
-    except (
-        subprocess.CalledProcessError,
-        OSError,
-        subprocess.TimeoutExpired,
-        ValueError,
-        TypeError,
-    ):
-        return False
+        if proc.returncode != 0:
+            err = (proc.stderr or "").strip().splitlines()
+            if any("unknown flag" in line for line in err):
+                return "installed gh is too old (no --source-ref); upgrade gh"
+            return "gh attestation verify failed" + (f": {err[-1]}" if err else "")
+        return attestation_policy_failure(
+            json.loads(proc.stdout), repo_id, owner_id, version
+        )
+    except (OSError, subprocess.TimeoutExpired, ValueError, TypeError) as exc:
+        return f"gh attestation verify failed: {exc}"
     finally:
         if bundle_path:
             try:
@@ -411,6 +456,7 @@ def main() -> int:
     ui.kv("installed", local, "ok")
 
     pinned = cfg.get("GITHUB_REPO_ID", "").strip()
+    owner_id = ""
     if not pinned:
         # The id pin is what ties GITHUB_REPO (and the name attestation is
         # checked against) to our repository; a name alone proves nothing.
@@ -462,6 +508,8 @@ def main() -> int:
             ui.step_ok("identity", f"id {pinned}")
         # From here on, only the pinned repository's current name is used.
         repo = detail
+        owner = meta.get("owner")
+        owner_id = str(owner.get("id") or "") if isinstance(owner, dict) else ""
 
     ui.step("github", "latest release")
     try:
@@ -597,19 +645,22 @@ def main() -> int:
             ui.warn(
                 "gh unavailable — attestation NOT verified, installing on sha256 only"
             )
-        elif verify_attestation(tar_path, repo, cfg.get("GITHUB_TOKEN", ""), pinned):
-            ui.step_ok("attest", "verified")
         else:
-            write_state(
-                {
-                    "installed_version": local,
-                    "latest_version": remote,
-                    "last_result": f"refused: attestation missing or invalid for {tag} ({repo})",
-                }
+            why = verify_attestation(
+                tar_path, repo, cfg.get("GITHUB_TOKEN", ""), pinned, owner_id, remote
             )
-            ui.step_fail("attest", f"not verified against {repo} release.yml")
-            ui.finish(False, "refusing to install")
-            return 1
+            if why:
+                write_state(
+                    {
+                        "installed_version": local,
+                        "latest_version": remote,
+                        "last_result": f"refused: attestation not verified for {tag}: {why}",
+                    }
+                )
+                ui.step_fail("attest", why)
+                ui.finish(False, "refusing to install")
+                return 1
+            ui.step_ok("attest", f"verified  repo id {pinned}, refs/tags/v{remote}")
 
         ui.step("install", f"v{remote}")
         install_tarball(tar_path)
