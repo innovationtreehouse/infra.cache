@@ -247,6 +247,20 @@ bash /opt/src/linux/install.sh >/dev/null 2>&1
 ck "reinstall from tree exit 0" $?
 [ -e "$WD" ] && [ -e "$SH" ]
 ck "shared reinstall: login prompt + shell hint present" $?
+# Units run with no HOME/USER and the scripts use set -u: no shell errors there.
+out="$(env -i PATH=/usr/sbin:/usr/bin:/sbin:/bin bash /opt/src/linux/install.sh --no-restart-docker 2>&1)"
+ck "install with systemd's bare environment exit 0" $?
+! grep -E 'unbound variable|command not found|syntax error' <<<"$out"
+ck "install with bare environment: no shell errors" $?
+since="$(date '+%Y-%m-%d %H:%M:%S')"
+echo 9.9.9 >/usr/local/lib/facility-cache/VERSION # nothing newer: runs only this tree's updater
+systemctl start facility-cache-apply.service facility-cache-update.service
+ck "apply + update units ran" $?
+! journalctl --no-pager -o cat --since "$since" -u facility-cache-apply.service -u facility-cache-update.service |
+  grep -E 'unbound variable|command not found|syntax error|: line [0-9]+: '
+ck "apply/update unit journals: no shell errors" $?
+[ -n "$(find /var/log/facility-cache/client.jsonl -newermt "$since" 2>/dev/null)" ]
+ck "root events still logged to /var/log/facility-cache/client.jsonl" $?
 facility-cache uninstall
 ck "uninstall exit 0" $?
 [ ! -e /usr/local/sbin/facility-cache-apply ] && [ ! -e /usr/local/bin/facility-cache ] && [ ! -d /usr/local/lib/facility-cache ]
