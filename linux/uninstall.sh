@@ -44,6 +44,9 @@ systemctl daemon-reload
 ui_step_ok "timers and units removed"
 
 ui_step "files" "binaries and drop-ins"
+if command -v git >/dev/null 2>&1; then
+  git config --system --fixed-value --unset-all include.path /usr/local/lib/facility-cache/shared.gitconfig 2>/dev/null || true
+fi
 rm -f /etc/apt/apt.conf.d/00facility-cache
 rm -f /etc/apt/sources.list.d/facility-cache-github-cli.list
 rm -f /etc/apt/keyrings/facility-cache-githubcli.gpg
@@ -53,6 +56,7 @@ rm -f /etc/NetworkManager/dispatcher.d/99-facility-cache
 rm -f /usr/local/bin/facility-cache
 rm -f /usr/local/bin/facility-cache-probe
 rm -f /usr/local/bin/facility-apt-proxy
+rm -f /usr/local/bin/treehouse-git
 rm -f /usr/local/sbin/facility-cache-apply
 rm -f /usr/local/sbin/facility-cache-update
 rm -rf /usr/local/lib/facility-cache

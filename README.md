@@ -41,6 +41,13 @@ the bare `gh attestation verify --repo ...` form, which *does* require a
 commands below, and `docs/SECURITY.md`). If `gh` still cannot be
 installed, SHA-256 still runs and attestations stay warn-only.
 
+## Shared machines: GitHub sign-in
+
+On opted-in shared-login computers, each member signs in to GitHub as
+themself with `treehouse-git signin`, so commits are attributed to them.
+The sign-in ends at logout, on `treehouse-git signout`, or after 36 hours.
+See [docs/SHARED-MACHINES.md](docs/SHARED-MACHINES.md).
+
 ## Ubuntu — first install from a Release
 
 `innovationtreehouse/cache` is a public repo — no token, no `gh auth login`.

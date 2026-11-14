@@ -41,6 +41,7 @@ foreach ($name in @(
     'FacilityCache-Update.ps1',
     'Install-FacilityCache.ps1',
     'Status-FacilityCache.ps1',
+    'Treehouse-Git.ps1',
     'Uninstall-FacilityCache.ps1'
 )) {
     $src = Join-Path $here $name
@@ -52,6 +53,17 @@ $srcDefaults = Join-Path $root 'defaults.json'
 if (Test-Path $srcDefaults) {
     Copy-Item -LiteralPath $srcDefaults -Destination (Join-Path $dest 'defaults.json') -Force
 }
+$srcShared = Join-Path $root 'shared.gitconfig'
+if (Test-Path $srcShared) {
+    Copy-Item -LiteralPath $srcShared -Destination (Join-Path $dest 'shared.gitconfig') -Force
+}
+# SystemRoot is on every PATH for every user from the first logon, and members
+# cannot modify it, so no PATH edits are needed. Git Bash does not apply PATHEXT:
+# there the command is `treehouse-git.cmd`.
+@(
+    '@echo off',
+    'powershell.exe -NoProfile -ExecutionPolicy Bypass -File "%ProgramData%\FacilityCache\Treehouse-Git.ps1" %*'
+) | Set-Content -LiteralPath (Join-Path $env:SystemRoot 'treehouse-git.cmd') -Encoding ASCII
 # Always record the resolved version (zip VERSION, git describe, or dev).
 $ver | Set-Content -LiteralPath (Join-Path $dest 'VERSION') -Encoding ASCII
 
@@ -99,7 +111,7 @@ Write-FcStep 'apply' 'LAN drop-ins'
 Invoke-FacilityCacheApply
 Write-FcStepOk 'pip/npm/uv follow the facility LAN'
 
-Write-FcStep 'tasks' 'apply + update'
+Write-FcStep 'tasks' 'apply + update + session reset'
 $taskName = 'FacilityCache-Apply'
 Unregister-ScheduledTask -TaskName $taskName -Confirm:$false -ErrorAction SilentlyContinue
 
@@ -149,7 +161,38 @@ $updateTriggers = @(
 )
 Register-ScheduledTask -TaskName $updateName -Action $updateAction -Trigger $updateTriggers -Principal $principal `
     -Description 'Install newer facility-cache-client GitHub Releases' | Out-Null
-Write-FcStepOk 'FacilityCache-Apply 5m · FacilityCache-Update daily'
+
+# Shared-machine GitHub session wipe (no-op when no session exists). Startup,
+# any logon, and logoff only: lock/unlock and reconnect must NOT reset it.
+$resetName = 'FacilityCache-SessionReset'
+Unregister-ScheduledTask -TaskName $resetName -Confirm:$false -ErrorAction SilentlyContinue
+$resetArg = "-NoProfile -WindowStyle Hidden -ExecutionPolicy Bypass -Command `"Import-Module '$(Join-Path $dest 'FacilityCache.psm1')'; Reset-TreehouseGitSession`""
+$resetAction = New-ScheduledTaskAction -Execute 'powershell.exe' -Argument $resetArg
+$resetTriggers = @(
+    (New-ScheduledTaskTrigger -AtStartup),
+    (New-ScheduledTaskTrigger -AtLogOn)
+)
+try {
+    $logoffXml = @'
+<QueryList>
+  <Query Id="0" Path="System">
+    <Select Path="System">*[System[Provider[@Name='Microsoft-Windows-Winlogon'] and EventID=7002]]</Select>
+  </Query>
+</QueryList>
+'@
+    $logoffClass = Get-CimClass -ClassName MSFT_TaskEventTrigger -Namespace root/Microsoft/Windows/TaskScheduler
+    $logoffTrigger = New-CimInstance -CimClass $logoffClass -ClientOnly
+    $logoffTrigger.Enabled = $true
+    $logoffTrigger.Subscription = $logoffXml
+    $resetTriggers += $logoffTrigger
+} catch {
+    Write-Host 'Could not register a logoff trigger; session resets at startup, logon and expiry only.'
+}
+# Default task settings skip runs on battery; a missed reset would leave a member signed in.
+$resetSettings = New-ScheduledTaskSettingsSet -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries
+Register-ScheduledTask -TaskName $resetName -Action $resetAction -Trigger $resetTriggers -Principal $principal `
+    -Settings $resetSettings -Description 'Sign shared-machine members out of GitHub at startup, logon and logoff' | Out-Null
+Write-FcStepOk 'FacilityCache-Apply 5m · FacilityCache-Update daily · FacilityCache-SessionReset logon/logoff'
 
 Write-FcFinish -Ok $true -Message "v$ver ready"
 Write-FcNote 'Status-FacilityCache.ps1     dashboard'

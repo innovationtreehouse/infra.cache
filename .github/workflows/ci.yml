@@ -98,4 +98,6 @@ jobs:
       - name: python unit tests
         run: python3 -m unittest discover -s tests -v
       - name: shell self-check
-        run: bash tests/test_common.sh
+        run: |
+          bash tests/test_common.sh
+          bash tests/test_gh_session.sh

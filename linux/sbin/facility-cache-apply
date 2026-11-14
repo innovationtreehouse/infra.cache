@@ -130,6 +130,7 @@ print_status() {
   [[ "$AUTO_UPDATE" == 0 || "$AUTO_UPDATE" == false ]] && auto_k=off
   ui_kv "updates" "auto=${AUTO_UPDATE}" "$auto_k"
   ui_kv "repo" "$GITHUB_REPO"
+  ui_kv "shared" "$(shared_machine && echo on || echo off)  sessions ${GH_SESSION_HOURS}h" "$(shared_machine && echo on || echo off)"
   if command -v gh >/dev/null 2>&1; then
     ui_kv "gh" "$(gh --version 2>/dev/null | head -n1 | tr -d '\r')" on
   else
@@ -242,6 +243,10 @@ write_env_files() {
     if [[ "$NPM_ON" -eq 1 ]]; then
       echo "NPM_CONFIG_REGISTRY=$(npm_registry_url)"
     fi
+    if shared_machine; then
+      echo 'GH_CONFIG_DIR=${XDG_RUNTIME_DIR}/treehouse-gh/gh'
+      echo 'GIT_CONFIG_GLOBAL=${XDG_RUNTIME_DIR}/treehouse-gh/gitconfig'
+    fi
   } >"$tmp"
 
   # profile.d: exported vars for interactive shells
@@ -256,11 +261,14 @@ write_env_files() {
     if [[ "$NPM_ON" -eq 1 ]]; then
       echo "export NPM_CONFIG_REGISTRY=$(npm_registry_url)"
     fi
+    if shared_machine; then
+      echo "TREEHOUSE_SHARED_MACHINE=1"
+    fi
   } >"$ENV_FILE"
   chmod 644 "$ENV_FILE"
 
   mkdir -p "$(dirname "$ENV_DROPIN")"
-  if [[ "$PYPI_ON" -eq 1 || "$NPM_ON" -eq 1 ]]; then
+  if [[ "$PYPI_ON" -eq 1 || "$NPM_ON" -eq 1 ]] || shared_machine; then
     # systemd environment.d: KEY=VALUE, no export
     grep -v '^#' "$tmp" | grep -v '^$' >"$ENV_DROPIN" || true
     if [[ ! -s "$ENV_DROPIN" ]]; then
@@ -290,6 +298,21 @@ else
 fi
 
 write_env_files
+
+# Shared machines: system gitconfig includes our defaults; removed again when off.
+# Never fatal — a locked /etc/gitconfig must not stop the rest of apply.
+if command -v git >/dev/null 2>&1; then
+  if shared_machine; then
+    git config --system --get-all include.path 2>/dev/null | grep -qxF "$SHARED_GITCONFIG" ||
+      git config --system --add include.path "$SHARED_GITCONFIG" 2>/dev/null || true
+  else
+    git config --system --fixed-value --unset-all include.path "$SHARED_GITCONFIG" 2>/dev/null || true
+  fi
+fi
+# Expire shared GitHub sessions (also revokes their tokens).
+if [[ -x /usr/local/bin/treehouse-git ]]; then
+  /usr/local/bin/treehouse-git sweep || true
+fi
 
 # Keep the gh apt source pointed at apt-cacher-ng on-site and at GitHub
 # off-site. Do not apt-get install here — that is install/update/bootstrap.

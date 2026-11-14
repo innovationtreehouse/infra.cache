@@ -30,6 +30,7 @@ LINUX_FILES = [
     "linux/bin/facility-cache",
     "linux/bin/facility-cache-probe",
     "linux/bin/facility-apt-proxy",
+    "linux/bin/treehouse-git",
     "linux/sbin/facility-cache-apply",
     "linux/sbin/facility-cache-update",
     "linux/sbin/facility-cache-ensure-gh",
@@ -50,6 +51,7 @@ WINDOWS_FILES = [
     "windows/Uninstall-FacilityCache.ps1",
     "windows/Status-FacilityCache.ps1",
     "windows/Install-FromGitHub.ps1",
+    "windows/Treehouse-Git.ps1",
 ]
 
 
@@ -96,7 +98,7 @@ def main() -> None:
         linux_tar = DIST / "facility-cache-client-linux.tar.gz"
         with tarfile.open(linux_tar, "w:gz") as tar:
             tar.add(version_file, arcname=f"{prefix}/VERSION")
-            for rel in ["README.md", "defaults.env"]:
+            for rel in ["README.md", "defaults.env", "shared.gitconfig"]:
                 tar.add(ROOT / rel, arcname=f"{prefix}/{rel}")
             for rel in LINUX_FILES:
                 tar.add(ROOT / rel, arcname=f"{prefix}/{rel}")
@@ -104,7 +106,7 @@ def main() -> None:
         win_zip = DIST / "facility-cache-client-windows.zip"
         with zipfile.ZipFile(win_zip, "w", zipfile.ZIP_DEFLATED) as zf:
             zf.write(version_file, arcname=f"{prefix}/VERSION")
-            for rel in ["README.md", "defaults.json"]:
+            for rel in ["README.md", "defaults.json", "shared.gitconfig"]:
                 zf.write(ROOT / rel, arcname=f"{prefix}/{rel}")
             for rel in WINDOWS_FILES:
                 zf.write(ROOT / rel, arcname=f"{prefix}/{rel}")

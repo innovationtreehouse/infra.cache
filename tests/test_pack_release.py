@@ -111,7 +111,7 @@ class PackTest(unittest.TestCase):
             members = set(tar.getnames())
         expected = {
             f"{self.prefix}/{rel}"
-            for rel in ["VERSION", "README.md", "defaults.env"]
+            for rel in ["VERSION", "README.md", "defaults.env", "shared.gitconfig"]
             + pack_release.LINUX_FILES
         }
         self.assertEqual(members, expected)
@@ -121,7 +121,7 @@ class PackTest(unittest.TestCase):
             members = set(zf.namelist())
         expected = {
             f"{self.prefix}/{rel}"
-            for rel in ["VERSION", "README.md", "defaults.json"]
+            for rel in ["VERSION", "README.md", "defaults.json", "shared.gitconfig"]
             + pack_release.WINDOWS_FILES
         }
         self.assertEqual(members, expected)

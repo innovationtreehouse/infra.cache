@@ -162,6 +162,24 @@ systemctl is-failed --quiet facility-cache-apply.service
 [ $? -ne 0 ]
 ck "apply.service not failed" $?
 
+sec "T9b shared machine mode"
+write_config "SHARED_MACHINE=1"
+/usr/local/sbin/facility-cache-apply
+ck "shared apply exit 0" $?
+[ -x /usr/local/bin/treehouse-git ]
+ck "treehouse-git installed" $?
+git config --system --get-all include.path | grep -qxF /usr/local/lib/facility-cache/shared.gitconfig
+ck "system gitconfig includes shared.gitconfig" $?
+grep -q '^TREEHOUSE_SHARED_MACHINE=1' /run/facility-cache/env
+ck "env file flags shared machine" $?
+grep -q '^GH_CONFIG_DIR=' /etc/environment.d/60-facility-cache.conf
+ck "environment.d sets GH_CONFIG_DIR" $?
+write_config
+/usr/local/sbin/facility-cache-apply
+ck "non-shared apply exit 0" $?
+! git config --system --get-all include.path 2>/dev/null | grep -q shared.gitconfig
+ck "system gitconfig include removed" $?
+
 sec "T10 update: --check, repo-id pin refusal, then full update (real GitHub + attestation)"
 echo 1.0.0 >/usr/local/lib/facility-cache/VERSION
 facility-cache update --check >/tmp/upcheck 2>&1
@@ -202,6 +220,8 @@ python3 -c "import json,sys; d=json.load(open('/etc/docker/daemon.json')); sys.e
 ck "daemon.json restored from backup" $?
 [ -f /etc/docker/daemon.json.facility-cache.uninstalled ]
 ck "pre-restore snapshot kept" $?
+[ ! -e /usr/local/bin/treehouse-git ]
+ck "treehouse-git removed" $?
 [ -f /etc/facility-cache/config ]
 ck "local config left in place" $?
 [ ! -f /etc/xdg/pip/pip.conf ] && [ ! -f /etc/npmrc ]

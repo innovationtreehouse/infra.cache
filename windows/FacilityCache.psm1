@@ -12,6 +12,8 @@ $script:DefaultConfig = @{
     GitHubRepo       = 'innovationtreehouse/cache'
     GitHubRepoId     = 1343160243
     AutoUpdate       = $true
+    SharedMachine    = $false
+    GhSessionHours   = 36
 }
 
 function Merge-FacilityCacheObject {
@@ -213,6 +215,7 @@ function Show-FacilityCacheDashboard {
     }
     Write-Host ''
     Write-FcKv 'updates' $(if ($st.AutoUpdate) { 'auto on' } else { 'auto off' }) $(if ($st.AutoUpdate) { 'on' } else { 'off' })
+    Write-FcKv 'shared' $(if ($st.SharedMachine) { 'on  treehouse-git signin' } else { 'off' }) $(if ($st.SharedMachine) { 'on' } else { 'off' })
     Write-FcKv 'repo' $st.GitHubRepo
     $last = 'never'
     if ($st.Update) {
@@ -325,6 +328,7 @@ function Get-FacilityCacheStatus {
         Version    = Get-FacilityCacheInstalledVersion
         GitHubRepo = $cfg.GitHubRepo
         AutoUpdate = $cfg.AutoUpdate
+        SharedMachine = ($cfg.SharedMachine -eq $true)
         Update     = $state
     }
 }
@@ -539,6 +543,182 @@ allow-insecure-host = ["$($cfg.CacheHost)"]
                 & npm config delete registry --location=global 2>$null
             }
         }
+    }
+
+    Set-TreehouseGitSharedMachine
+}
+
+# Shared-machine GitHub sign-in (treehouse-git). One session per MACHINE, not per
+# user: shared machines have one Windows account, and SYSTEM tasks must be able
+# to wipe it at logon/logoff/startup.
+function Get-TreehouseGitSessionDir {
+    return (Join-Path (Get-FacilityCacheInstallDir) 'gh-session')
+}
+
+function Get-TreehouseGitSessionExpiry {
+    # 0 when missing or unparseable, so callers fail closed (treat as expired).
+    $exp = [long]0
+    try {
+        $raw = Get-Content -LiteralPath (Join-Path (Get-TreehouseGitSessionDir) 'expires') -Raw -ErrorAction Stop
+        [void][long]::TryParse(([string]$raw).Trim(), [ref]$exp)
+    } catch { }
+    return $exp
+}
+
+function Reset-TreehouseGitSession {
+    # Revokes any gh token on GitHub, then deletes the session dir's CONTENTS
+    # (the dir and its ACL stay; a non-admin member could not recreate them).
+    # Runs as SYSTEM (tasks) and as the member (signout), on a member-writable dir.
+    param([switch]$OnlyIfExpired)
+    $d = Get-TreehouseGitSessionDir
+    $item = Get-Item -LiteralPath $d -Force -ErrorAction SilentlyContinue
+    if (-not $item) { return }
+    if (-not $item.PSIsContainer -or ($item.Attributes -band [IO.FileAttributes]::ReparsePoint)) {
+        # Planted file/junction: remove the link itself, never read or wipe a target as SYSTEM.
+        if ($item.PSIsContainer) { [IO.Directory]::Delete($d, $false) } else { [IO.File]::Delete($d) }
+        return
+    }
+    $children = @(Get-ChildItem -LiteralPath $d -Force)
+    if ($OnlyIfExpired) {
+        if ($children.Count -eq 0) { return }
+        if ([DateTimeOffset]::UtcNow.ToUnixTimeSeconds() -lt (Get-TreehouseGitSessionExpiry)) { return }
+    }
+    $hosts = Join-Path $d 'gh\hosts.yml'
+    $tokens = @()
+    if (Test-Path -LiteralPath $hosts -PathType Leaf) {
+        # User-writable file read by SYSTEM: only ever post strings shaped like gh tokens.
+        $tokens = @(Get-Content -LiteralPath $hosts -ErrorAction SilentlyContinue | ForEach-Object {
+            if ($_ -cmatch '^\s*oauth_token:\s*(gh[a-z]_[A-Za-z0-9_]+)\s*$') { $Matches[1] }
+        } | Select-Object -Unique)
+    }
+    if ($tokens.Count -gt 0) {
+        try {
+            [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
+            # Built by hand: the regex limits tokens to [A-Za-z0-9_], and this stays an
+            # array for one token on every PowerShell version.
+            $body = '{"credentials":["' + ($tokens -join '","') + '"]}'
+            # Must be unauthenticated: GitHub answers 403 to any Authorization header.
+            Invoke-RestMethod -Method Post -Uri 'https://api.github.com/credentials/revoke' -Body $body `
+                -ContentType 'application/json' -TimeoutSec 10 `
+                -Headers @{ Accept = 'application/vnd.github+json'; 'User-Agent' = 'facility-cache-client' } | Out-Null
+        } catch {
+            Write-FcWarn "could not revoke the GitHub token: $($_.Exception.Message)"
+        }
+    }
+    foreach ($c in $children) {
+        # .NET's recursive delete removes junctions/symlinks without following them;
+        # PS 5.1's Remove-Item -Recurse does follow them, so do not use it here.
+        if ($c.PSIsContainer) { [IO.Directory]::Delete($c.FullName, $true) } else { [IO.File]::Delete($c.FullName) }
+    }
+}
+
+function Set-TreehouseGitSharedMachine {
+    $cfg = Get-FacilityCacheConfig
+    $d = Get-TreehouseGitSessionDir
+    $ghDir = Join-Path $d 'gh'
+    $gitCfg = Join-Path $d 'gitconfig'
+    $include = (Join-Path (Get-FacilityCacheInstallDir) 'shared.gitconfig').Replace('\', '/')
+    $git = Get-Command git -ErrorAction SilentlyContinue
+    $includes = @()
+    if ($git) { $includes = @(& git config --system --get-all include.path 2>$null) }
+    if ($cfg.SharedMachine -eq $true) {
+        Reset-TreehouseGitSession -OnlyIfExpired
+        if (-not (Test-Path -LiteralPath $d)) {
+            New-Item -ItemType Directory -Path $d -Force | Out-Null
+            # BUILTIN\Users modify, by SID so it works on any display language.
+            & icacls.exe $d /grant '*S-1-5-32-545:(OI)(CI)M' | Out-Null
+            if ($LASTEXITCODE -ne 0) { Write-FcWarn "icacls on $d exited $LASTEXITCODE" }
+        }
+        Set-MachineEnv -Name 'GH_CONFIG_DIR' -Value $ghDir
+        Set-MachineEnv -Name 'GIT_CONFIG_GLOBAL' -Value $gitCfg
+        if ($git -and $includes -notcontains $include) {
+            & git config --system --add include.path $include
+        }
+    } else {
+        if ([Environment]::GetEnvironmentVariable('GH_CONFIG_DIR', 'Machine') -eq $ghDir) {
+            Set-MachineEnv -Name 'GH_CONFIG_DIR' -Value $null
+        }
+        if ([Environment]::GetEnvironmentVariable('GIT_CONFIG_GLOBAL', 'Machine') -eq $gitCfg) {
+            Set-MachineEnv -Name 'GIT_CONFIG_GLOBAL' -Value $null
+        }
+        if ($git -and $includes -contains $include) {
+            & git config --system --fixed-value --unset-all include.path $include
+        }
+        Reset-TreehouseGitSession
+    }
+}
+
+function Start-TreehouseGitSession {
+    # Member sign-in (non-admin). Returns $true when signed in.
+    $cfg = Get-FacilityCacheConfig
+    $d = Get-TreehouseGitSessionDir
+    if ($cfg.SharedMachine -ne $true -or -not (Test-Path -LiteralPath $d -PathType Container)) {
+        Write-FcFail 'treehouse-git is only for shared machines (SharedMachine in config.json)'
+        return $false
+    }
+    foreach ($tool in @('gh', 'git')) {
+        if (-not (Get-Command $tool -ErrorAction SilentlyContinue)) {
+            Write-FcFail "$tool is not installed"
+            return $false
+        }
+    }
+    Reset-TreehouseGitSession
+    # Written before login so an interrupted sign-in still expires.
+    $expires = [DateTimeOffset]::UtcNow.ToUnixTimeSeconds() + [long]([double]$cfg.GhSessionHours * 3600)
+    Set-Content -LiteralPath (Join-Path $d 'expires') -Value $expires -Encoding ASCII
+    $env:GH_CONFIG_DIR = Join-Path $d 'gh'
+    $env:GIT_CONFIG_GLOBAL = Join-Path $d 'gitconfig'
+    $env:GH_PROMPT_DISABLED = '1'
+    Remove-Item Env:GH_TOKEN, Env:GITHUB_TOKEN, Env:GH_HOST -ErrorAction SilentlyContinue
+
+    Write-Host ''
+    Write-Host '  Sign in to GitHub as yourself:' -ForegroundColor Cyan
+    Write-Host '    1. ON YOUR PHONE, open https://github.com/login/device'
+    Write-Host '    2. Enter the one-time code shown below and approve'
+    Write-Host '  Do not sign in to GitHub in this computer''s browser.' -ForegroundColor Yellow
+    Write-Host ''
+    & gh auth login --hostname github.com --git-protocol https --web --insecure-storage --skip-ssh-key | Out-Host
+    if ($LASTEXITCODE -ne 0) {
+        Reset-TreehouseGitSession
+        Write-FcFail 'GitHub sign-in did not complete'
+        return $false
+    }
+
+    # gh prints UTF-8; 5.1 would decode it with the OEM code page and mangle names.
+    $prevEnc = [Console]::OutputEncoding
+    try {
+        [Console]::OutputEncoding = [Text.Encoding]::UTF8
+        $info = & gh api user --jq '[.login, .id, (.name // .login)] | @tsv'
+    } finally {
+        [Console]::OutputEncoding = $prevEnc
+    }
+    $f = @(([string]$info).Trim() -split "`t")
+    if ($f.Count -lt 2 -or $f[0] -notmatch '^[A-Za-z0-9-]+$' -or $f[1] -notmatch '^\d+$') {
+        Reset-TreehouseGitSession
+        Write-FcFail 'could not read your GitHub profile'
+        return $false
+    }
+    $login = $f[0]
+    $name = $login
+    if ($f.Count -ge 3 -and $f[2].Trim()) { $name = $f[2].Trim() }
+    & git config --global user.name $name
+    & git config --global user.email "$($f[1])+$login@users.noreply.github.com"
+    Set-Content -LiteralPath (Join-Path $d 'login') -Value $login -Encoding ASCII
+    Write-FcOk "signed in to GitHub as $login ($name)"
+    Write-FcNote "until $([DateTimeOffset]::FromUnixTimeSeconds($expires).LocalDateTime.ToString('ddd HH:mm')), or until you log off or run: treehouse-git signout"
+    return $true
+}
+
+function Show-TreehouseGitSession {
+    $login = ''
+    try {
+        $login = ([string](Get-Content -LiteralPath (Join-Path (Get-TreehouseGitSessionDir) 'login') -Raw -ErrorAction Stop)).Trim()
+    } catch { }
+    $left = (Get-TreehouseGitSessionExpiry) - [DateTimeOffset]::UtcNow.ToUnixTimeSeconds()
+    if ($login -and $left -gt 0) {
+        Write-FcOk ('signed in to GitHub as {0}  {1}h {2}m left' -f $login, [Math]::Floor($left / 3600), [Math]::Floor(($left % 3600) / 60))
+    } else {
+        Write-FcNote 'not signed in to GitHub  (treehouse-git signin)'
     }
 }
 
@@ -942,6 +1122,7 @@ Export-ModuleMember -Function @(
     'Update-FacilityCacheClient',
     'Sync-FacilityCacheGitHubCli',
     'Test-FacilityCacheAttestation',
+    'Reset-TreehouseGitSession', 'Start-TreehouseGitSession', 'Show-TreehouseGitSession',
     'Write-FcHeader', 'Write-FcKv', 'Write-FcOk', 'Write-FcFail', 'Write-FcWarn',
     'Write-FcNote', 'Write-FcStep', 'Write-FcStepOk', 'Write-FcBar', 'Write-FcFinish'
 )

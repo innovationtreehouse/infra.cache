@@ -35,12 +35,28 @@ Write-FcStep 'tasks' 'scheduled tasks'
 # could rewrite env vars / pip.ini / npm's registry after the cleanup below runs.
 Stop-ScheduledTask -TaskName 'FacilityCache-Apply' -ErrorAction SilentlyContinue
 Stop-ScheduledTask -TaskName 'FacilityCache-Update' -ErrorAction SilentlyContinue
+Stop-ScheduledTask -TaskName 'FacilityCache-SessionReset' -ErrorAction SilentlyContinue
 Unregister-ScheduledTask -TaskName 'FacilityCache-Apply' -Confirm:$false -ErrorAction SilentlyContinue
 Unregister-ScheduledTask -TaskName 'FacilityCache-Update' -Confirm:$false -ErrorAction SilentlyContinue
-Write-FcStepOk 'Apply + Update unregistered'
+Unregister-ScheduledTask -TaskName 'FacilityCache-SessionReset' -Confirm:$false -ErrorAction SilentlyContinue
+Write-FcStepOk 'Apply + Update + SessionReset unregistered'
+
+# Shared-machine GitHub session: revoke + wipe while the module is still loaded
+# (the files step below then removes the gh-session dir itself).
+if (Get-Command Reset-TreehouseGitSession -ErrorAction SilentlyContinue) {
+    Reset-TreehouseGitSession
+}
+if (Get-Command git -ErrorAction SilentlyContinue) {
+    $include = (Join-Path $dest 'shared.gitconfig').Replace('\', '/')
+    if (@(& git config --system --get-all include.path) -contains $include) {
+        & git config --system --fixed-value --unset-all include.path $include
+    }
+}
+Remove-Item -LiteralPath (Join-Path $env:SystemRoot 'treehouse-git.cmd') -Force -ErrorAction SilentlyContinue
 
 foreach ($name in @(
-    'PIP_INDEX_URL', 'PIP_TRUSTED_HOST', 'UV_INDEX_URL', 'UV_INSECURE_HOST', 'NPM_CONFIG_REGISTRY'
+    'PIP_INDEX_URL', 'PIP_TRUSTED_HOST', 'UV_INDEX_URL', 'UV_INSECURE_HOST', 'NPM_CONFIG_REGISTRY',
+    'GH_CONFIG_DIR', 'GIT_CONFIG_GLOBAL'
 )) {
     [Environment]::SetEnvironmentVariable($name, $null, 'Machine')
 }

@@ -75,6 +75,8 @@ if [[ ! -f /etc/facility-cache/config ]]; then
 # EXPECTED_IP=10.41.1.50
 # GITHUB_REPO=innovationtreehouse/cache
 # AUTO_UPDATE=1
+# SHARED_MACHINE=1
+# GH_SESSION_HOURS=36
 EOF
   chmod 644 /etc/facility-cache/config
   ui_step_ok "wrote /etc/facility-cache/config"
@@ -99,12 +101,16 @@ install -m 0644 "${HERE}/lib/ensure_gh.sh" "${STAGE}/lib/ensure_gh.sh"
 if [[ -f "${ROOT}/defaults.env" ]]; then
   install -m 0644 "${ROOT}/defaults.env" "${STAGE}/lib/defaults"
 fi
+if [[ -f "${ROOT}/shared.gitconfig" ]]; then
+  install -m 0644 "${ROOT}/shared.gitconfig" "${STAGE}/lib/shared.gitconfig"
+fi
 # Always record the resolved version (tarball VERSION, git describe, or dev).
 printf '%s\n' "$VER" >"${STAGE}/lib/VERSION"
 chmod 0644 "${STAGE}/lib/VERSION"
 install -m 0755 "${HERE}/bin/facility-cache" "${STAGE}/bin/facility-cache"
 install -m 0755 "${HERE}/bin/facility-cache-probe" "${STAGE}/bin/facility-cache-probe"
 install -m 0755 "${HERE}/bin/facility-apt-proxy" "${STAGE}/bin/facility-apt-proxy"
+install -m 0755 "${HERE}/bin/treehouse-git" "${STAGE}/bin/treehouse-git"
 install -m 0755 "${HERE}/sbin/facility-cache-apply" "${STAGE}/sbin/facility-cache-apply"
 install -m 0755 "${HERE}/sbin/facility-cache-update" "${STAGE}/sbin/facility-cache-update"
 install -m 0755 "${HERE}/sbin/facility-cache-ensure-gh" "${STAGE}/sbin/facility-cache-ensure-gh"

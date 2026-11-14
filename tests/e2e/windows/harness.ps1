@@ -120,13 +120,54 @@ if ($state.last_result -eq 'updated') {
 }
 Check 'update re-registered tasks' ([bool](Get-ScheduledTask -TaskName 'FacilityCache-Apply' -ErrorAction SilentlyContinue))
 
-Section 'T7 uninstall'
+Section 'T7 shared machine: gh session dir, env, reset task, shim'
+# T6 installed the latest RELEASE; reinstall this tree so the feature under test is present.
+& powershell.exe -NoProfile -ExecutionPolicy Bypass -File (Join-Path $RepoRoot 'windows\Install-FacilityCache.ps1') -NoRestartDocker -NoDocker
+Check 'reinstall from tree exit 0' ($LASTEXITCODE -eq 0) "exit=$LASTEXITCODE"
+$apply = Join-Path $env:ProgramData 'FacilityCache\FacilityCache-Apply.ps1'
+$sess = Join-Path $env:ProgramData 'FacilityCache\gh-session'
+$include = (Join-Path $env:ProgramData 'FacilityCache\shared.gitconfig').Replace('\', '/')
+Check 'installed: Treehouse-Git.ps1, shared.gitconfig' ((Test-Path (Join-Path $env:ProgramData 'FacilityCache\Treehouse-Git.ps1')) -and (Test-Path (Join-Path $env:ProgramData 'FacilityCache\shared.gitconfig')))
+Check 'task FacilityCache-SessionReset registered' ([bool](Get-ScheduledTask -TaskName 'FacilityCache-SessionReset' -ErrorAction SilentlyContinue))
+Check 'shim treehouse-git.cmd in SystemRoot' (Test-Path (Join-Path $env:SystemRoot 'treehouse-git.cmd'))
+Check 'not shared by default: no machine GH_CONFIG_DIR' (-not (Get-MachineEnvVar 'GH_CONFIG_DIR'))
+Write-FcConfig @{ SharedMachine = $true }
+& powershell.exe -NoProfile -ExecutionPolicy Bypass -File $apply
+Check 'apply (shared) exit 0' ($LASTEXITCODE -eq 0)
+Check 'session dir created' (Test-Path -LiteralPath $sess -PathType Container)
+$usersM = @((Get-Acl -LiteralPath $sess).GetAccessRules($true, $false, [Security.Principal.SecurityIdentifier]) | Where-Object {
+    $_.IdentityReference.Value -eq 'S-1-5-32-545' -and ($_.FileSystemRights -band [Security.AccessControl.FileSystemRights]::Modify) -eq [Security.AccessControl.FileSystemRights]::Modify
+})
+Check 'session dir grants BUILTIN\Users modify' ($usersM.Count -gt 0)
+Check 'machine env GH_CONFIG_DIR set' ((Get-MachineEnvVar 'GH_CONFIG_DIR') -eq (Join-Path $sess 'gh')) (Get-MachineEnvVar 'GH_CONFIG_DIR')
+Check 'machine env GIT_CONFIG_GLOBAL set' ((Get-MachineEnvVar 'GIT_CONFIG_GLOBAL') -eq (Join-Path $sess 'gitconfig'))
+if (Get-Command git -ErrorAction SilentlyContinue) {
+    Check 'git system include added' (@(& git config --system --get-all include.path) -contains $include)
+}
+New-Item -ItemType Directory -Force -Path (Join-Path $sess 'gh') | Out-Null
+# Deliberately NOT token-shaped, so the reset posts nothing to GitHub.
+"github.com:`n    user: e2e`n    oauth_token: not-a-real-token" | Set-Content (Join-Path $sess 'gh\hosts.yml') -Encoding ASCII
+'1' | Set-Content (Join-Path $sess 'expires') -Encoding ASCII
+& powershell.exe -NoProfile -ExecutionPolicy Bypass -File $apply
+Check 'apply (expired session) exit 0' ($LASTEXITCODE -eq 0)
+Check 'expired session contents wiped, dir kept' ((Test-Path -LiteralPath $sess) -and @(Get-ChildItem -LiteralPath $sess -Force).Count -eq 0)
+Write-FcConfig $null
+& powershell.exe -NoProfile -ExecutionPolicy Bypass -File $apply
+Check 'apply (not shared) exit 0' ($LASTEXITCODE -eq 0)
+Check 'machine env GH_CONFIG_DIR / GIT_CONFIG_GLOBAL cleared' (-not (Get-MachineEnvVar 'GH_CONFIG_DIR') -and -not (Get-MachineEnvVar 'GIT_CONFIG_GLOBAL'))
+if (Get-Command git -ErrorAction SilentlyContinue) {
+    Check 'git system include removed' (@(& git config --system --get-all include.path) -notcontains $include)
+}
+
+Section 'T8 uninstall'
 & powershell.exe -NoProfile -ExecutionPolicy Bypass -File (Join-Path $env:ProgramData 'FacilityCache\Uninstall-FacilityCache.ps1')
 Check 'uninstall exit 0' ($LASTEXITCODE -eq 0)
 Check 'tasks unregistered' (-not (Get-ScheduledTask -TaskName 'FacilityCache-Apply' -ErrorAction SilentlyContinue) -and -not (Get-ScheduledTask -TaskName 'FacilityCache-Update' -ErrorAction SilentlyContinue))
 $do2 = Get-ItemProperty 'HKLM:\SOFTWARE\Policies\Microsoft\Windows\DeliveryOptimization' -ErrorAction SilentlyContinue
 Check 'DO policy removed' (-not $do2 -or -not $do2.PSObject.Properties['DOCacheHostSource'])
 Check 'machine env cleared' (-not (Get-MachineEnvVar 'PIP_INDEX_URL') -and -not (Get-MachineEnvVar 'NPM_CONFIG_REGISTRY'))
+Check 'task FacilityCache-SessionReset unregistered' (-not (Get-ScheduledTask -TaskName 'FacilityCache-SessionReset' -ErrorAction SilentlyContinue))
+Check 'shim treehouse-git.cmd removed' (-not (Test-Path (Join-Path $env:SystemRoot 'treehouse-git.cmd')))
 Check 'module removed' (-not (Test-Path (Join-Path $env:ProgramData 'FacilityCache\FacilityCache.psm1')))
 Check 'config.json kept' (Test-Path (Join-Path $env:ProgramData 'FacilityCache\config.json'))
 Check 'logs kept' (Test-Path (Join-Path $env:ProgramData 'FacilityCache\logs'))

@@ -12,6 +12,10 @@ DOCKER_GHCR_PORT="${DOCKER_GHCR_PORT:-5001}"
 PROBE_TIMEOUT_SEC="${PROBE_TIMEOUT_SEC:-1}"
 GITHUB_REPO="${GITHUB_REPO:-innovationtreehouse/cache}"
 AUTO_UPDATE="${AUTO_UPDATE:-1}"
+SHARED_MACHINE="${SHARED_MACHINE:-0}"
+GH_SESSION_HOURS="${GH_SESSION_HOURS:-36}"
+# shellcheck disable=SC2034  # read by facility-cache-apply
+SHARED_GITCONFIG="/usr/local/lib/facility-cache/shared.gitconfig"
 
 CONFIG_FILE="${FACILITY_CACHE_CONFIG:-/etc/facility-cache/config}"
 RUN_DIR="${FACILITY_CACHE_RUN_DIR:-/run/facility-cache}"
@@ -44,6 +48,10 @@ if [[ -r "$CONFIG_FILE" ]]; then
   # shellcheck disable=SC1090
   source "$CONFIG_FILE"
 fi
+
+shared_machine() {
+  [[ "$SHARED_MACHINE" == 1 || "$SHARED_MACHINE" == true ]]
+}
 
 cache_base_url() {
   printf 'http://%s' "$CACHE_HOST"

@@ -9,5 +9,7 @@
   "ProbeTimeoutMs": 1000,
   "GitHubRepo": "innovationtreehouse/cache",
   "GitHubRepoId": 1343160243,
-  "AutoUpdate": true
+  "AutoUpdate": true,
+  "SharedMachine": false,
+  "GhSessionHours": 36
 }

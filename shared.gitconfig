@@ -1,0 +1,15 @@
+# facility-cache-managed — included from the system gitconfig on shared machines.
+# GitHub credentials come only from the per-login gh session (treehouse-git signin).
+[credential]
+	helper =
+[credential "https://github.com"]
+	helper =
+	helper = !gh auth git-credential
+[credential "https://gist.github.com"]
+	helper =
+	helper = !gh auth git-credential
+[user]
+	useConfigOnly = true
+[url "https://github.com/"]
+	insteadOf = git@github.com:
+	insteadOf = ssh://git@github.com/
