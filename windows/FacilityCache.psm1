@@ -15,6 +15,7 @@ $script:DefaultConfig = @{
     AutoUpdate       = $true
     SharedMachine    = $false
     GhSessionHours   = 36
+    SignInPromptAtLogin = $true
 }
 
 # Well-known SIDs: names are localized, SIDs are not.
@@ -919,11 +920,106 @@ function Set-TreehouseGitUserEnv {
     }
 }
 
+# Sign-in prompts for members (Linux: treehouse-git hint/welcome; same text).
+# The login pop-up is a value under HKLM ...\Run: Explorer starts it in each
+# interactive desktop logon only (not SSH, not tasks, not unlock), and only
+# admins can change it. The Git Bash hint lives in Git for Windows' own
+# etc\profile.d (Program Files: admin-only). Not covered: Windows PowerShell
+# (an all-users profile is under System32 and breaks under the default
+# Restricted execution policy) and cmd.exe (AutoRun runs for every cmd, scripts
+# included); the login pop-up covers those users.
+$script:WelcomeRunKey = 'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Run'
+$script:WelcomeRunName = 'FacilityCacheGitHubSignIn'
+
+function Get-FcGitBashHintPath {
+    # <Git for Windows root>\etc\profile.d\treehouse-git.sh, from the trusted git.
+    $git = Get-FcTrustedCommand git
+    if (-not $git) { return $null }
+    $root = Split-Path -Parent (Split-Path -Parent $git)
+    $dir = Join-Path $root 'etc\profile.d'
+    if (-not (Test-Path -LiteralPath $dir -PathType Container)) { return $null }
+    return (Join-Path $dir 'treehouse-git.sh')
+}
+
+function Set-TreehouseGitPrompts {
+    param([switch]$Remove)
+    $cfg = Get-FacilityCacheConfig
+    $welcome = (-not $Remove) -and ($cfg.SignInPromptAtLogin -ne $false)
+    if ($welcome) {
+        $ps = Join-Path $env:SystemRoot 'System32\WindowsPowerShell\v1.0\powershell.exe'
+        $script = Join-Path (Get-FacilityCacheInstallDir) 'Treehouse-Git.ps1'
+        $cmd = "`"$ps`" -NoProfile -ExecutionPolicy Bypass -File `"$script`" welcome"
+        if ((Get-ItemProperty -LiteralPath $script:WelcomeRunKey -Name $script:WelcomeRunName -ErrorAction SilentlyContinue).$script:WelcomeRunName -ne $cmd) {
+            New-ItemProperty -LiteralPath $script:WelcomeRunKey -Name $script:WelcomeRunName -Value $cmd -PropertyType String -Force | Out-Null
+        }
+    } else {
+        Remove-ItemProperty -LiteralPath $script:WelcomeRunKey -Name $script:WelcomeRunName -ErrorAction SilentlyContinue
+    }
+    $hint = Get-FcGitBashHintPath
+    if (-not $hint) { return }
+    if ($Remove) {
+        Remove-Item -LiteralPath $hint -Force -ErrorAction SilentlyContinue
+        return
+    }
+    # Builtins only (no gh, no PowerShell): this runs at every Git Bash start.
+    # Git Bash cannot run a .cmd without its extension, hence the function.
+    $body = @'
+# facility-cache-managed: GitHub sign-in hint for interactive Git Bash on this shared machine.
+treehouse-git() { treehouse-git.cmd "$@"; }
+case $- in *i*) ;; *) return 0 ;; esac
+_th_s="${LOCALAPPDATA//\\//}/FacilityCache/gh-session"
+_th_login="" _th_exp=0 _th_now=0
+[ -s "$_th_s/login" ] && read -r _th_login <"$_th_s/login"
+[ -r "$_th_s/expires" ] && read -r _th_exp <"$_th_s/expires"
+_th_login="${_th_login%$'\r'}" _th_exp="${_th_exp%$'\r'}"
+printf -v _th_now '%(%s)T' -1
+if [ -n "$_th_login" ] && [[ "$_th_exp" =~ ^[0-9]+$ ]] && ((_th_now < _th_exp)); then
+  _th_left=$((_th_exp - _th_now))
+  echo "Signed in to GitHub as $_th_login ($((_th_left / 3600))h $((_th_left % 3600 / 60))m left)"
+else
+  echo "Not signed in to GitHub. Run: treehouse-git signin"
+fi
+unset _th_s _th_login _th_exp _th_now _th_left
+'@
+    $body = $body.Replace("`r`n", "`n")
+    $cur = $null
+    if (Test-Path -LiteralPath $hint) { $cur = [IO.File]::ReadAllText($hint) }
+    if ($cur -ne $body) { [IO.File]::WriteAllText($hint, $body, (New-Object Text.UTF8Encoding($false))) }
+}
+
+function Get-TreehouseGitHint {
+    # One line for a terminal; file reads only.
+    $d = Get-TreehouseGitSessionDir
+    $login = ''
+    try { $login = ([string](Get-Content -LiteralPath (Join-Path $d 'login') -Raw -ErrorAction Stop)).Trim() } catch { }
+    $left = (Get-TreehouseGitSessionExpiry -Dir $d) - [DateTimeOffset]::UtcNow.ToUnixTimeSeconds()
+    if ($login -and $left -gt 0) {
+        return ('Signed in to GitHub as {0} ({1}h {2}m left)' -f $login, [Math]::Floor($left / 3600), [Math]::Floor(($left % 3600) / 60))
+    }
+    return 'Not signed in to GitHub. Run: treehouse-git signin'
+}
+
+function Show-TreehouseGitWelcome {
+    # Login pop-up (HKLM Run): quiet unless a member on a shared machine with no live session.
+    $cfg = Get-FacilityCacheConfig
+    if ($cfg.SharedMachine -ne $true -or (Test-FcElevated)) { return }
+    if ((Get-TreehouseGitHint) -like 'Signed in*') { return }
+    Write-Host ''
+    Write-Host '  This is a shared computer, and you are not signed in to GitHub.'
+    Write-Host '  Sign in now so your commits and pushes are made as you. The sign-in ends'
+    Write-Host "  when you log out, or after $($cfg.GhSessionHours) hours. Later: treehouse-git signin"
+    Write-Host ''
+    try { [void](Read-Host '  Press Enter to sign in now, or close this window to skip') } catch { return }
+    [void](Start-TreehouseGitSession)
+    try { [void](Read-Host '  Press Enter to close this window') } catch { }
+}
+
 function Disable-TreehouseGitSharedMachine {
     # SharedMachine off / uninstall: remove our user-scope env, the system git
-    # include, and every session.
+    # include, the sign-in prompts, and every session.
     param([switch]$IncludeUnloaded)
     Set-TreehouseGitUserEnv -Remove -IncludeUnloaded:$IncludeUnloaded
+    Set-TreehouseGitPrompts -Remove
     $include = (Join-Path (Get-FacilityCacheInstallDir) 'shared.gitconfig').Replace('\', '/')
     if (@(Invoke-FcSystemGit config --system --get-all include.path) -contains $include) {
         Invoke-FcSystemGit config --system --fixed-value --unset-all include.path $include | Out-Null
@@ -948,6 +1044,7 @@ function Set-TreehouseGitSharedMachine {
     }
     [void](Reset-TreehouseGitSession -OnlyIfExpired)
     Set-TreehouseGitUserEnv
+    Set-TreehouseGitPrompts
     $include = (Join-Path (Get-FacilityCacheInstallDir) 'shared.gitconfig').Replace('\', '/')
     if (@(Invoke-FcSystemGit config --system --get-all include.path) -notcontains $include) {
         Invoke-FcSystemGit config --system --add include.path $include | Out-Null
@@ -1505,6 +1602,7 @@ Export-ModuleMember -Function @(
     'Test-FacilityCacheAttestation',
     'Protect-FacilityCacheInstallDir', 'Get-FcTrustedCommand',
     'Reset-TreehouseGitSession', 'Start-TreehouseGitSession', 'Show-TreehouseGitSession',
+    'Get-TreehouseGitHint', 'Show-TreehouseGitWelcome',
     'Disable-TreehouseGitSharedMachine',
     'Write-FcHeader', 'Write-FcKv', 'Write-FcOk', 'Write-FcFail', 'Write-FcWarn',
     'Write-FcNote', 'Write-FcStep', 'Write-FcStepOk', 'Write-FcBar', 'Write-FcFinish'

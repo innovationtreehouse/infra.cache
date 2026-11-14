@@ -54,7 +54,9 @@ done
 # the version lives in git tags. Fall back to git describe, then a dev marker.
 VER="0.0.0-dev"
 if [[ -f "$ROOT/VERSION" ]]; then
-  VER="$(tr -d ' v\n' <"$ROOT/VERSION")"
+  # Strip whitespace and a leading v only: `tr -d ' v'` also ate the v in "-dev".
+  VER="$(tr -d ' \n' <"$ROOT/VERSION")"
+  VER="${VER#v}"
 elif command -v git >/dev/null 2>&1; then
   _described="$(git -C "$ROOT" describe --tags --match 'v*' --dirty 2>/dev/null || true)"
   [[ -n "$_described" ]] && VER="${_described#v}"
