@@ -48,8 +48,15 @@ jobs:
       - name: PSScriptAnalyzer (pwsh preinstalled on ubuntu-latest)
         shell: pwsh
         run: |
+          # Same gate as ci.yml (Error severity only). -EnableExit would exit with
+          # the count of ALL findings (~130 Warning/Information, e.g.
+          # PSAvoidUsingWriteHost), and since the release job needs this one,
+          # no release could ever be published.
           Install-Module -Name PSScriptAnalyzer -RequiredVersion 1.25.0 -Force -Scope CurrentUser
-          Invoke-ScriptAnalyzer -Path windows -Recurse -EnableExit
+          $findings = Get-ChildItem -Recurse -Path windows -Include *.ps1,*.psm1 |
+            ForEach-Object { Invoke-ScriptAnalyzer -Path $_.FullName }
+          $findings | Format-Table -AutoSize | Out-String | Write-Host
+          if ($findings | Where-Object Severity -eq 'Error') { exit 1 }
 
   test:
     runs-on: ubuntu-latest
