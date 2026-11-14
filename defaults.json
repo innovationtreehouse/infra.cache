@@ -11,5 +11,6 @@
   "GitHubRepoId": 1343160243,
   "AutoUpdate": true,
   "SharedMachine": false,
-  "GhSessionHours": 36
+  "GhSessionHours": 36,
+  "SignInPromptAtLogin": true
 }

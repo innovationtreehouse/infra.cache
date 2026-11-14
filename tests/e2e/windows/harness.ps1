@@ -173,6 +173,16 @@ Check 'user env GIT_CONFIG_GLOBAL -> own profile' ((Get-UserEnvVar 'GIT_CONFIG_G
 if (Get-Command git -ErrorAction SilentlyContinue) {
     Check 'git system include added' (@(& git config --system --get-all include.path) -contains $include)
 }
+$runKey = 'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Run'
+$runVal = (Get-ItemProperty -LiteralPath $runKey -Name FacilityCacheGitHubSignIn -ErrorAction SilentlyContinue).FacilityCacheGitHubSignIn
+Check 'login sign-in prompt registered (HKLM Run, absolute paths)' ([bool]($runVal -match '^"[A-Z]:\\Windows\\System32\\WindowsPowerShell\\v1\.0\\powershell\.exe" .*-File "[A-Z]:\\ProgramData\\FacilityCache\\Treehouse-Git\.ps1" welcome$')) $runVal
+$hintOut = & powershell.exe -NoProfile -ExecutionPolicy Bypass -File (Join-Path $fcDir 'Treehouse-Git.ps1') hint
+Check 'treehouse-git hint (no session)' ($hintOut -eq 'Not signed in to GitHub. Run: treehouse-git signin') "$hintOut"
+Write-FcConfig @{ SharedMachine = $true; SignInPromptAtLogin = $false }
+& powershell.exe -NoProfile -ExecutionPolicy Bypass -File $apply
+Check 'SignInPromptAtLogin false removes the login prompt' (-not (Get-ItemProperty -LiteralPath $runKey -Name FacilityCacheGitHubSignIn -ErrorAction SilentlyContinue))
+Write-FcConfig @{ SharedMachine = $true }
+& powershell.exe -NoProfile -ExecutionPolicy Bypass -File $apply
 New-Item -ItemType Directory -Force -Path (Join-Path $sess 'gh') | Out-Null
 # Deliberately NOT token-shaped, so the reset posts nothing to GitHub.
 "github.com:`n    user: e2e`n    oauth_token: not-a-real-token" | Set-Content (Join-Path $sess 'gh\hosts.yml') -Encoding ASCII
@@ -203,6 +213,7 @@ Check 'user env GH_CONFIG_DIR / GIT_CONFIG_GLOBAL cleared' (-not (Get-UserEnvVar
 if (Get-Command git -ErrorAction SilentlyContinue) {
     Check 'git system include removed' (@(& git config --system --get-all include.path) -notcontains $include)
 }
+Check 'not shared: no login prompt' (-not (Get-ItemProperty -LiteralPath $runKey -Name FacilityCacheGitHubSignIn -ErrorAction SilentlyContinue))
 Write-FcConfig @{ SharedMachine = $true }
 & powershell.exe -NoProfile -ExecutionPolicy Bypass -File $apply
 New-Item -ItemType Directory -Force -Path $sess | Out-Null
@@ -236,6 +247,7 @@ Check 'DO policy removed' (-not $do2 -or -not $do2.PSObject.Properties['DOCacheH
 Check 'machine env cleared' (-not (Get-MachineEnvVar 'PIP_INDEX_URL') -and -not (Get-MachineEnvVar 'NPM_CONFIG_REGISTRY'))
 Check 'task FacilityCache-SessionReset unregistered' (-not (Get-ScheduledTask -TaskName 'FacilityCache-SessionReset' -ErrorAction SilentlyContinue))
 Check 'shim treehouse-git.cmd removed' (-not (Test-Path (Join-Path $env:SystemRoot 'treehouse-git.cmd')))
+Check 'uninstall: login prompt removed' (-not (Get-ItemProperty -LiteralPath $runKey -Name FacilityCacheGitHubSignIn -ErrorAction SilentlyContinue))
 Check 'uninstall: user env GH_CONFIG_DIR / GIT_CONFIG_GLOBAL removed' (-not (Get-UserEnvVar 'GH_CONFIG_DIR') -and -not (Get-UserEnvVar 'GIT_CONFIG_GLOBAL'))
 Check 'uninstall: gh session removed' (-not (Test-Path -LiteralPath $sess))
 Check 'module removed' (-not (Test-Path (Join-Path $env:ProgramData 'FacilityCache\FacilityCache.psm1')))
