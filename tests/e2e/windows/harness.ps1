@@ -126,6 +126,8 @@ $v = (Get-Content (Join-Path $env:ProgramData 'FacilityCache\VERSION') -Raw).Tri
 # repo/owner id + release.yml at refs/tags/v<version>, so it must still verify.
 Check 'full update: clean (state=updated, VERSION advanced)' ($updExit -eq 0 -and $state.last_result -eq 'updated' -and $v -ne '1.0.0') "exit=$updExit result=$($state.last_result) now $v"
 Check 'attestation verified by repo id during update' ($state.attestation -eq 'verified' -and [bool]($upd -match 'verified')) "attestation=$($state.attestation)"
+$attLine = @(Get-Content (Join-Path $fcDir 'logs\client.jsonl') | Where-Object { $_ -match '"event":"step_ok"' -and $_ -match '"msg":"attest verified  repo id 1343160243, owner id \d+, refs/tags/v' + [regex]::Escape($v) + '"' }) | Select-Object -Last 1
+Check 'client.jsonl records attest verified with repo id, owner id and tag' ([bool]$attLine) "$attLine"
 Check 'update re-registered tasks' ([bool](Get-ScheduledTask -TaskName 'FacilityCache-Apply' -ErrorAction SilentlyContinue))
 
 Section 'T7 install-dir hardening + shared machine: per-user gh session, env, reset task, shim'
