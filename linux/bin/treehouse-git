@@ -1,0 +1,161 @@
+#!/bin/bash
+# Per-login GitHub identity for shared machines. The token and git identity
+# live in the login session's tmpfs, so OS logout/reboot forgets them.
+set -euo pipefail
+
+LIB="/usr/local/lib/facility-cache"
+if [[ ! -r "$LIB/common.sh" ]]; then
+  LIB="$(cd "$(dirname "$0")/../lib" 2>/dev/null && pwd)"
+fi
+# shellcheck source=/dev/null
+source "$LIB/common.sh"
+
+RUN_BASE="${TREEHOUSE_RUN_BASE:-/run/user}"
+RUNTIME="${XDG_RUNTIME_DIR:-$RUN_BASE/$(id -u)}"
+S="$RUNTIME/treehouse-gh"
+
+usage() {
+  cat <<EOT
+Usage: treehouse-git signin|signout|status
+
+  signin   sign in to GitHub as yourself (until you log out, or $GH_SESSION_HOURS hours)
+  signout  forget your GitHub sign-in and revoke the token
+  status   who is signed in, and for how long
+EOT
+}
+
+# Print session dir $1's gh/hosts.yml. The user owns everything under it and
+# can swap entries at any time, so refuse links, and when root (the sweep) read
+# it as the uid named by the $RUN_BASE/<uid>/ path (logind's, not the user's):
+# a link swapped in after the check then reaches only what that user can read.
+read_hosts() {
+  local f="$1/gh/hosts.yml" uid
+  [[ -d "$1/gh" && ! -L "$1/gh" && -f "$f" && ! -L "$f" ]] || return 1
+  if [[ "$(id -u)" -ne 0 ]]; then
+    cat -- "$f"
+    return
+  fi
+  uid="$(basename "$(dirname "$1")")"
+  [[ "$uid" =~ ^[0-9]+$ ]] || return 1
+  setpriv --reuid="$uid" --regid="$(id -g "$uid")" --clear-groups -- cat -- "$f"
+}
+
+# Revoke every gh*_ token found in session $1's hosts.yml. Unauthenticated on
+# purpose: GitHub rejects this endpoint when an Authorization header is present.
+revoke_tokens() {
+  local tokens json
+  tokens="$(read_hosts "$1" 2>/dev/null | sed -n 's/^[[:space:]]*oauth_token:[[:space:]]*//p' |
+    tr -d "\"'\r " | grep -E '^gh[a-z]_[A-Za-z0-9_]+$' | sort -u || true)"
+  [[ -n "$tokens" ]] || return 0
+  json="$(printf '%s\n' "$tokens" | sed 's/.*/"&"/' | paste -sd, -)"
+  printf '{"credentials":[%s]}' "$json" |
+    curl -fsS -m 10 -o /dev/null -X POST -H 'Accept: application/vnd.github+json' \
+      -H 'Content-Type: application/json' --data-binary @- https://api.github.com/credentials/revoke
+}
+
+end_session() {
+  local d="$1"
+  [[ -d "$d" && ! -L "$d" ]] || return 0
+  if ! revoke_tokens "$d"; then
+    echo "treehouse-git: token removed locally but could not be revoked on GitHub" >&2
+  fi
+  rm -rf "$d"
+}
+
+cmd_signin() {
+  if ! shared_machine; then
+    echo "treehouse-git: this computer is not a shared machine." >&2
+    echo "Set SHARED_MACHINE=1 in $CONFIG_FILE to enable it." >&2
+    exit 1
+  fi
+  command -v gh >/dev/null 2>&1 || {
+    echo "treehouse-git: gh (GitHub CLI) is not installed" >&2
+    exit 1
+  }
+  command -v git >/dev/null 2>&1 || {
+    echo "treehouse-git: git is not installed" >&2
+    exit 1
+  }
+  if [[ ! -d "$RUNTIME" ]]; then
+    echo "treehouse-git: $RUNTIME does not exist; sign in from a normal desktop login" >&2
+    exit 1
+  fi
+  end_session "$S"
+  install -d -m 0700 "$S"
+  # Written before login so a sweep mid-login never sees a session with no expiry.
+  echo $(($(date +%s) + GH_SESSION_HOURS * 3600)) >"$S/expires"
+  export GH_CONFIG_DIR="$S/gh" GIT_CONFIG_GLOBAL="$S/gitconfig" GH_PROMPT_DISABLED=1
+  unset GH_TOKEN GITHUB_TOKEN GH_HOST
+
+  cat <<EOT
+
+  On YOUR PHONE, open https://github.com/login/device, enter the code below, and approve.
+  Do not sign in to GitHub in this computer's browser.
+
+EOT
+  if ! gh auth login --hostname github.com --git-protocol https --web --insecure-storage --skip-ssh-key; then
+    end_session "$S"
+    echo "treehouse-git: sign-in failed" >&2
+    exit 1
+  fi
+  local login id name
+  IFS=$'\t' read -r login id name < <(gh api user --jq '[.login, .id, (.name // .login)] | @tsv') || {
+    end_session "$S"
+    echo "treehouse-git: could not read your GitHub profile" >&2
+    exit 1
+  }
+  git config --global user.name "${name:-$login}"
+  git config --global user.email "${id}+${login}@users.noreply.github.com"
+  printf '%s\n' "$login" >"$S/login"
+  echo "Signed in as $login. Session ends $(date -d "@$(<"$S/expires")" '+%a %H:%M') or at logout."
+  if [[ "${ORIG_GIT_CONFIG_GLOBAL-unset}" != "$S/gitconfig" ]]; then
+    echo "Warning: this terminal predates setup; log out and back in so git uses your identity." >&2
+  fi
+}
+
+cmd_signout() {
+  end_session "$S"
+  echo "Signed out of GitHub."
+}
+
+cmd_status() {
+  if [[ ! -s "$S/login" ]]; then
+    echo "Not signed in to GitHub. Run: treehouse-git signin"
+    exit 1
+  fi
+  local left=$(($(<"$S/expires") - $(date +%s)))
+  echo "Signed in as $(<"$S/login"), $((left / 3600))h $((left % 3600 / 60))m remaining."
+  local repo_email
+  if repo_email="$(git config --local user.email 2>/dev/null)" && [[ -n "$repo_email" ]]; then
+    echo "Warning: this repo sets user.email=$repo_email, which overrides your identity." >&2
+    echo "  git config --local --unset user.email; git config --local --unset user.name" >&2
+  fi
+}
+
+cmd_sweep() {
+  local d exp
+  for d in "$RUN_BASE"/*/treehouse-gh; do
+    [[ -d "$d" ]] || continue
+    exp="$(cat "$d/expires" 2>/dev/null || true)"
+    # Missing or garbled expiry counts as expired (fail closed).
+    if [[ ! "$exp" =~ ^[0-9]+$ ]] || (($(date +%s) >= 10#$exp)); then
+      end_session "$d" || true
+    fi
+  done
+  return 0
+}
+
+ORIG_GIT_CONFIG_GLOBAL="${GIT_CONFIG_GLOBAL-unset}"
+case "${1:-}" in
+signin) cmd_signin ;;
+signout) cmd_signout ;;
+status) cmd_status ;;
+sweep) cmd_sweep ;;
+-h | --help | help)
+  usage
+  ;;
+*)
+  usage >&2
+  exit 2
+  ;;
+esac

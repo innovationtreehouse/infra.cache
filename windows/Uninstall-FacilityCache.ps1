@@ -35,12 +35,23 @@ Write-FcStep 'tasks' 'scheduled tasks'
 # could rewrite env vars / pip.ini / npm's registry after the cleanup below runs.
 Stop-ScheduledTask -TaskName 'FacilityCache-Apply' -ErrorAction SilentlyContinue
 Stop-ScheduledTask -TaskName 'FacilityCache-Update' -ErrorAction SilentlyContinue
+Stop-ScheduledTask -TaskName 'FacilityCache-SessionReset' -ErrorAction SilentlyContinue
 Unregister-ScheduledTask -TaskName 'FacilityCache-Apply' -Confirm:$false -ErrorAction SilentlyContinue
 Unregister-ScheduledTask -TaskName 'FacilityCache-Update' -Confirm:$false -ErrorAction SilentlyContinue
-Write-FcStepOk 'Apply + Update unregistered'
+Unregister-ScheduledTask -TaskName 'FacilityCache-SessionReset' -Confirm:$false -ErrorAction SilentlyContinue
+Write-FcStepOk 'Apply + Update + SessionReset unregistered'
+
+# Shared-machine GitHub sign-in: revoke + delete every profile's session, drop
+# the user-scope env vars (also from hives of accounts not logged on) and the
+# system git include, while the module is still loaded.
+if (Get-Command Disable-TreehouseGitSharedMachine -ErrorAction SilentlyContinue) {
+    Disable-TreehouseGitSharedMachine -IncludeUnloaded
+}
+Remove-Item -LiteralPath (Join-Path $env:SystemRoot 'treehouse-git.cmd') -Force -ErrorAction SilentlyContinue
 
 foreach ($name in @(
-    'PIP_INDEX_URL', 'PIP_TRUSTED_HOST', 'UV_INDEX_URL', 'UV_INSECURE_HOST', 'NPM_CONFIG_REGISTRY'
+    'PIP_INDEX_URL', 'PIP_TRUSTED_HOST', 'UV_INDEX_URL', 'UV_INSECURE_HOST', 'NPM_CONFIG_REGISTRY',
+    'GH_CONFIG_DIR', 'GIT_CONFIG_GLOBAL'
 )) {
     [Environment]::SetEnvironmentVariable($name, $null, 'Machine')
 }
@@ -66,9 +77,13 @@ if ($npmCmd) {
         $fcCfg = Get-FacilityCacheConfig
         $npmRegistry = "http://$($fcCfg.CacheHost):$($fcCfg.NpmPort)/"
     }
-    $currentRegistry = (& npm config get registry --location=global 2>$null)
-    if ($npmRegistry -and $currentRegistry -and $currentRegistry.Trim() -eq $npmRegistry) {
-        & npm config delete registry --location=global 2>$null
+    # Continue in a child scope: npm warnings on stderr must not abort uninstall under Stop (PS 5.1).
+    & {
+        $ErrorActionPreference = 'Continue'
+        $currentRegistry = (& npm config get registry --location=global 2>$null)
+        if ($npmRegistry -and $currentRegistry -and ([string]$currentRegistry).Trim() -eq $npmRegistry) {
+            & npm config delete registry --location=global 2>$null
+        }
     }
 }
 

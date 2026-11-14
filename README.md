@@ -1,12 +1,14 @@
 # Facility cache client
 
-Points Ubuntu and Windows machines at `cache.facility.innovationtreehouse.org` **only while they are on the facility LAN**. Off-site, the hostname does not resolve in public DNS, so clients go direct to Ubuntu/PyPI/npm/Docker Hub/Microsoft.
+Points Ubuntu and Windows machines at `cache.facility.innovationtreehouse.org` **only while they are on the facility LAN**. Off-site, the hostname does not resolve in public DNS, so clients go direct to Ubuntu/PyPI/npm/Docker Hub/Microsoft. That detection trusts the local resolver: a hostile network (rogue DHCP/DNS) can fake being the facility and receive pip/npm/Docker traffic over plain HTTP — see [`docs/SECURITY.md`](docs/SECURITY.md#lan-trust-not-transport-security).
 
 Never uses `10.41.1.50` or the short name `cache` in client config (those collide on other networks). The probe requires the FQDN to resolve to **exactly** `10.41.1.50`.
 
-Installed clients **update themselves from GitHub Releases**. A new tag publishes new scripts *and* new package defaults (host, ports, repo). Local override files are not overwritten.
+Installed clients **update themselves from GitHub Releases**, as root/SYSTEM. A new tag publishes new scripts *and* new package defaults (host, ports, repo). Local override files are not overwritten.
 
-Default repo: `innovationtreehouse/cache`.
+Default repo: `innovationtreehouse/infra.cache` (formerly `innovationtreehouse/cache`; clients pin the numeric repo id `1343160243`).
+
+The repo is currently **private**: while it is, release downloads and attestation lookups return 404 without a token, so every client needs a read token in its token file (see below). If it is public, no token is needed.
 
 The cache host itself (`10.41.1.50`, apt-cacher-ng/devpi/verdaccio/Docker mirrors on ports 3141-5001) is an **external dependency**: this repo only configures clients to find it, it does not provision or run that box. See the org's infra repo for how the cache host is built and kept up.
 
@@ -29,32 +31,42 @@ The cache host itself (`10.41.1.50`, apt-cacher-ng/devpi/verdaccio/Docker mirror
 First install and the daily updater install `gh` if it is missing, and
 upgrade it when GitHub's apt repo / winget has a newer version. On the
 facility LAN the Ubuntu package is fetched through apt-cacher-ng
-(`http://cache…:3142/https://cli.github.com/packages`) so later machines
-reuse the cached `.deb`. Off-site, and on Windows (winget or the GitHub
-Releases MSI), it is a direct GitHub download.
+(`http://cache…:3142/cli.github.com/packages`) so later machines reuse the
+cached `.deb`; the apt signing key is always fetched directly from
+`https://cli.github.com` and checked against pinned fingerprints. Off-site,
+and on Windows (winget or the GitHub Releases MSI), it is a direct GitHub
+download.
 
-No `gh auth login` is required for this public repo: the client fetches
-the Sigstore bundle from the public, unauthenticated GitHub attestations
-API and verifies it offline with `gh attestation verify --bundle` — never
-the bare `gh attestation verify --repo ...` form, which *does* require a
-`gh auth login`/token even for a public repo (see the manual-verification
-commands below, and `docs/SECURITY.md`). If `gh` still cannot be
-installed, SHA-256 still runs and attestations stay warn-only.
+`gh` is what verifies release attestations, and no `gh auth login` is
+needed for it: the client fetches the Sigstore bundle from the GitHub
+attestations API (with the token file's token while the repo is private)
+and verifies it with `gh attestation verify --bundle`. With `gh` present, a
+missing or invalid attestation means the update is refused. Only if `gh`
+cannot be installed does the client install on SHA-256 alone, with a loud
+warning — SHA-256 only proves the archive matches the release's own
+manifest, not who built it. See `docs/SECURITY.md`.
+
+## Shared machines: GitHub sign-in
+
+On opted-in shared-login computers, each member signs in to GitHub as
+themself with `treehouse-git signin`, so commits are attributed to them.
+The sign-in ends at logout, on `treehouse-git signout`, or after 36 hours.
+See [docs/SHARED-MACHINES.md](docs/SHARED-MACHINES.md).
 
 ## Ubuntu — first install from a Release
 
-`innovationtreehouse/cache` is a public repo — no token, no `gh auth login`.
-Download, verify the bootstrap script, then run it. Note the **two-step**
-form: the plain `gh attestation verify FILE --repo ... --signer-workflow
-...` command (no `--bundle`) requires `gh auth login`/`GH_TOKEN` even
-against a public repo, so it is *not* what's used here:
+Download, verify the bootstrap script, then run it. These commands need
+`gh` on PATH and work without a token **while the repo is public**. The
+**two-step** form is used because the plain `gh attestation verify FILE
+--repo ... --signer-workflow ...` command (no `--bundle`) requires `gh auth
+login`/`GH_TOKEN` even against a public repo:
 
 ```bash
 curl -fsSL -o install-linux.sh \
-  https://github.com/innovationtreehouse/cache/releases/latest/download/install-linux.sh
+  https://github.com/innovationtreehouse/infra.cache/releases/latest/download/install-linux.sh
 DIGEST="$(sha256sum install-linux.sh | cut -d' ' -f1)"
 curl -fsSL -H "Accept: application/vnd.github+json" \
-  "https://api.github.com/repos/innovationtreehouse/cache/attestations/sha256:${DIGEST}" \
+  "https://api.github.com/repos/innovationtreehouse/infra.cache/attestations/sha256:${DIGEST}" \
   -o attestation.json
 python3 <<'PY'
 import json
@@ -65,9 +77,9 @@ with open("bundle.jsonl", "w", encoding="utf-8") as f:
         if isinstance(bundle, dict):
             f.write(json.dumps(bundle) + "\n")
 PY
-gh attestation verify install-linux.sh --repo innovationtreehouse/cache \
+gh attestation verify install-linux.sh --repo innovationtreehouse/infra.cache \
   --bundle bundle.jsonl \
-  --signer-workflow innovationtreehouse/cache/.github/workflows/release.yml \
+  --signer-workflow innovationtreehouse/infra.cache/.github/workflows/release.yml \
   --deny-self-hosted-runners
 sudo bash install-linux.sh
 facility-cache status
@@ -78,9 +90,29 @@ facility-cache version
 Lines — which is why every attestation for this file's SHA-256 is written
 out, not just the first.)
 
-`curl | sudo bash` still works and skips verifying the bootstrap script
-before it runs. The script installs `gh` if needed, then attests the
-tarball it downloaded.
+These use the post-rename names. `v1.0.3` and earlier were signed before the
+rename: verify those with `--repo innovationtreehouse/cache` and
+`--signer-workflow innovationtreehouse/cache/.github/workflows/release.yml`.
+
+**While the repo is private**, with a read token (fine-grained: Contents
+read, Attestations read) in `GH_TOKEN`:
+
+```bash
+gh release download --repo innovationtreehouse/infra.cache --pattern install-linux.sh
+gh attestation verify install-linux.sh --repo innovationtreehouse/infra.cache \
+  --signer-workflow innovationtreehouse/infra.cache/.github/workflows/release.yml \
+  --deny-self-hosted-runners
+sudo install -d -m 755 /etc/facility-cache
+sudo install -m 600 /dev/stdin /etc/facility-cache/github-token <<<"$GH_TOKEN"
+sudo bash install-linux.sh
+```
+
+`curl -fsSL …/install-linux.sh | sudo bash` works only while the repo is
+public. It skips verifying the bootstrap script itself: you run, as root,
+whatever `github.com` served, trusting only HTTPS. The script then installs
+`gh` (directly from GitHub, not from the download) and refuses to install a
+tarball whose SHA-256 or attestation does not verify; if `gh` cannot be
+installed it proceeds on SHA-256 alone and says so.
 
 From a git checkout instead:
 
@@ -103,9 +135,9 @@ If install found a `daemon.json.facility-cache.bak`, uninstall restores it exact
 
 Local overrides (kept across updates): `/etc/facility-cache/config`
 
-`/etc/facility-cache/github-token` (mode 600) is **only needed if this repo ever goes private again** — but if the file exists, its contents are still sent as a bearer token on every GitHub API call. Delete it if it's stale or you don't need it; a bad token in there will break updates even on a public repo.
+`/etc/facility-cache/github-token` (mode 600, root) holds the read token, which is **required while the repo is private**. If the file exists its contents are sent as a bearer token on every GitHub API call, so delete it if it's stale; a bad token breaks updates even on a public repo. Never put the token in `/etc/facility-cache/config` — that file is world-readable.
 
-A 5-minute timer re-applies LAN detection. A **daily** timer (with jitter) checks GitHub for a newer release, verifies `manifest.json` SHA-256 (and GitHub Artifact Attestations if `gh` is on PATH), and re-runs `install.sh` without restarting Docker. See `docs/SECURITY.md` for the self-update integrity/authenticity model in full.
+A 5-minute timer re-applies LAN detection. A **daily** timer (with jitter) checks GitHub for a newer release, verifies it (SHA-256 against `manifest.json`, then the GitHub Artifact Attestation — refused if that fails while `gh` is available) before running anything from it, and re-runs `install.sh` without restarting Docker. See `docs/SECURITY.md` for the self-update integrity/authenticity model in full.
 
 Commands draw a live terminal dashboard (steps, bars, on/off glyphs). The same events are appended as JSON lines you can fetch later:
 
@@ -121,20 +153,22 @@ facility-cache log --path           # where the file lives
 
 ## Windows — first install from a Release
 
-Elevated PowerShell. Same public-repo, no-auth model as Linux — no token
-needed. Verify the bootstrap script before executing it. Note the
-**two-step** form: `gh attestation verify FILE --repo ... --signer-workflow
-...` with no `--bundle` requires `gh auth login`/`GH_TOKEN` even against a
-public repo, so it is *not* what's used here:
+Elevated PowerShell, `gh` on PATH. As on Linux, these commands work without
+a token only **while the repo is public**; verify the bootstrap script
+before executing it. The **two-step** form is used because `gh attestation
+verify FILE --repo ... --signer-workflow ...` with no `--bundle` requires
+`gh auth login`/`GH_TOKEN` even against a public repo (for `v1.0.3` and
+earlier, use the pre-rename `innovationtreehouse/cache` names — see the
+Linux section):
 
 ```powershell
 Set-ExecutionPolicy -Scope Process Bypass
 Invoke-WebRequest -UseBasicParsing `
-  https://github.com/innovationtreehouse/cache/releases/latest/download/install-windows.ps1 `
+  https://github.com/innovationtreehouse/infra.cache/releases/latest/download/install-windows.ps1 `
   -OutFile install-windows.ps1
 $hash = (Get-FileHash install-windows.ps1 -Algorithm SHA256).Hash.ToLowerInvariant()
 $resp = Invoke-WebRequest -UseBasicParsing -Headers @{ Accept = 'application/vnd.github+json' } `
-  -Uri "https://api.github.com/repos/innovationtreehouse/cache/attestations/sha256:$hash"
+  -Uri "https://api.github.com/repos/innovationtreehouse/infra.cache/attestations/sha256:$hash"
 Add-Type -AssemblyName System.Web.Extensions
 $ser = New-Object System.Web.Script.Serialization.JavaScriptSerializer
 $ser.MaxJsonLength = [int]::MaxValue
@@ -145,12 +179,18 @@ $lines = $atts | ForEach-Object { $ser.Serialize($_['bundle']) }
 # Lines), which is why every attestation is written out, not just the first.
 $utf8NoBom = New-Object System.Text.UTF8Encoding($false)
 [System.IO.File]::WriteAllText("$PWD\bundle.jsonl", ($lines -join "`n"), $utf8NoBom)
-gh attestation verify .\install-windows.ps1 --repo innovationtreehouse/cache `
+gh attestation verify .\install-windows.ps1 --repo innovationtreehouse/infra.cache `
   --bundle bundle.jsonl `
-  --signer-workflow innovationtreehouse/cache/.github/workflows/release.yml `
+  --signer-workflow innovationtreehouse/infra.cache/.github/workflows/release.yml `
   --deny-self-hosted-runners
 .\install-windows.ps1
 ```
+
+While the repo is private: with `$env:GH_TOKEN` set to a read token, use
+`gh release download --repo innovationtreehouse/infra.cache --pattern install-windows.ps1`
+and the plain `gh attestation verify` form (as in the Linux section), write
+the token to `C:\ProgramData\FacilityCache\github-token`, then run
+`.\install-windows.ps1 -GitHubToken $env:GH_TOKEN`.
 
 From a checkout:
 
@@ -169,7 +209,7 @@ Scheduled tasks and drop-ins are removed; `config.json` and the event log under 
 
 Local overrides: `C:\ProgramData\FacilityCache\config.json` (start from `{}`).
 Package defaults: `C:\ProgramData\FacilityCache\defaults.json` (replaced on each release).
-`C:\ProgramData\FacilityCache\github-token` is **only needed if this repo ever goes private again** — but if it exists, it's still sent as a bearer token on every call. Delete it if it's stale; a bad token breaks updates even on a public repo.
+`C:\ProgramData\FacilityCache\github-token` holds the read token, **required while the repo is private**; restrict its ACL to SYSTEM and Administrators. If it exists it is sent as a bearer token on every call, so delete it if it's stale; a bad token breaks updates even on a public repo. Never put the token in `config.json` (`GitHubToken`) — that file is readable by every user.
 
 Scheduled tasks: `FacilityCache-Apply` (LAN, every 5 minutes) and `FacilityCache-Update` (GitHub, daily + at boot).
 
@@ -189,12 +229,19 @@ release workflow derives it from the pushed tag and generates the `VERSION`
 file that ships inside the archives.
 
 1. Change `defaults.env` / `defaults.json` if host, ports, or repo should move.
-2. Tag and push:
+2. Merge to `main`, then tag a commit **on `main`** and push the tag:
 
 ```bash
-git tag v1.0.1
+git tag v1.0.1 origin/main
 git push origin v1.0.1
 ```
+
+The workflow refuses a tag whose commit is not on `main`, runs lint and the
+unit tests first, runs in the `release` environment (where reviewers can be
+required), and never modifies an already-published release: a broken
+release is fixed with a new patch version. If a run fails half-way, re-run
+it (or dispatch the workflow against the tag); the leftover draft is
+replaced.
 
 GitHub Actions packs:
 
@@ -205,13 +252,16 @@ GitHub Actions packs:
 - `install-linux.sh` / `install-windows.ps1`
 
 Each of those files is attested (build provenance from `release.yml`) before
-the Release is published. Clients with `gh` verify the archive they download.
+the Release is published; this only works while the repo is public (or on
+GitHub Enterprise Cloud). The packer is reproducible: the same commit gives
+byte-identical archives.
 See `docs/SECURITY.md`. Clients pick a new release up on the next daily check
 (or immediately with `facility-cache update`).
 
 Pack locally without tagging: `python3 scripts/pack-release.py` — the
 version comes from `git describe --tags` (e.g. `1.0.1-3-gabc1234`), or from
-`FC_RELEASE_VERSION` if set.
+`FC_RELEASE_VERSION` if set; timestamps come from `SOURCE_DATE_EPOCH` or the
+commit time.
 
 ## UniFi (once, on the facility DHCP)
 
@@ -228,7 +278,7 @@ version comes from `git describe --tags` (e.g. `1.0.1-3-gabc1234`), or from
 - Auto-update does **not** restart Docker; restart it yourself if `daemon.json` changed.
 - Disable auto-update: `AUTO_UPDATE=0` in `/etc/facility-cache/config`, or `"AutoUpdate": false` in the Windows `config.json`.
 - Existing `/etc/pip.conf` or `/etc/npmrc` without a `facility-cache-managed` marker is left alone.
-- Docker's `registry-mirrors` / `insecure-registries` are written once at install/update time and **stay in `daemon.json` off-site too** — unlike pip/npm/uv they are not toggled on network change. dockerd only reads `daemon.json` at start (or a `docker restart docker`), so gating them on the LAN probe would mean restarting the daemon every time the network changes. Entries are always exact `host:port` strings (never a bare hostname or wildcard), so this only affects pulls explicitly addressed to that host:port — accepted trade-off for the trusted-LAN model.
+- Docker's `registry-mirrors` / `insecure-registries` are written once at install/update time and **stay in `daemon.json` off-site too** — unlike pip/npm/uv they are not toggled on network change. dockerd only reads `daemon.json` at start (or a `docker restart docker`), so gating them on the LAN probe would mean restarting the daemon every time the network changes. Entries are always exact `host:port` strings (never a bare hostname or wildcard), so this only affects pulls explicitly addressed to that host:port — accepted trade-off for the trusted-LAN model. A network that fakes the facility DNS answer re-activates them (see `docs/SECURITY.md`).
 - Changing `CACHE_HOST` between releases only *adds* the new host's entries to `daemon.json` — it does not remove the old host's. Old-host entries accumulate until something explicitly restores/edits `daemon.json` (uninstall's backup-restore does this; a plain update does not).
 - Trust model, integrity checks, and release-publishing controls: see [`docs/SECURITY.md`](docs/SECURITY.md).
-- Planned HTTPS on the cache host (public cert, keep the `.200` IP pin, drop `trusted-host` / `insecure-registries`): [`docs/HTTPS.md`](docs/HTTPS.md).
+- Planned HTTPS on the cache host (public cert, keep the `10.41.1.50` IP pin, drop `trusted-host` / `insecure-registries`): [`docs/HTTPS.md`](docs/HTTPS.md).

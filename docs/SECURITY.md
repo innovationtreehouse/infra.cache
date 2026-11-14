@@ -6,9 +6,9 @@ Every cache/mirror this client points at — apt-cacher-ng, devpi/pip, verdaccio
 the Docker Hub pull-through — serves **public package content only**: the same
 bytes anyone gets from Ubuntu/PyPI/npm/Docker Hub directly. No private
 package feeds, no credentials, no build artifacts flow through the facility
-cache. Compromising the cache host lets an attacker serve stale or malicious
-*public* packages to on-facility machines; it does not expose anything this
-repo's clients weren't already going to fetch from the public internet.
+cache. That does not make a compromised cache harmless: it can serve
+malicious packages to every tool on this list that does not verify
+signatures itself (pip, npm, Docker — see below). apt is the exception.
 
 ## LAN trust, not transport security
 
@@ -17,45 +17,93 @@ HTTP, on the facility LAN, by design — not HTTPS. That's a deliberate
 LAN-trust boundary: the facility network is treated as trusted transport, the
 same way a corporate office trusts its own switches. Do not extend reachability
 to that host beyond the facility LAN (no site-to-site VPN routing, no NAT
-forwarding it in) without revisiting this assumption — this repo's DNS design
-(the FQDN doesn't resolve off-site, see `README.md`) is the control that keeps
-it LAN-only today, and it's a DNS-based control, not a network ACL.
+forwarding it in) without revisiting this assumption.
 
-Putting a public TLS certificate on the cache host (and dropping pip/Docker
-HTTP bypasses) is a planned follow-up. The client will keep requiring that
-the FQDN resolve to `EXPECTED_IP`. See [`HTTPS.md`](HTTPS.md).
+**On-site detection can be spoofed.** The client decides it is on the facility
+LAN when `cache.facility.innovationtreehouse.org` resolves to `EXPECTED_IP`
+(`10.41.1.50`) and, for pip/npm/apt, a TCP connect to that IP's service port
+succeeds (`on_facility` / `dns_matches_expected` / `port_open` in
+`linux/lib/common.sh`, `Test-FacilityCache` in `windows/FacilityCache.psm1`).
+That is only true of honest resolvers. On a network whose DHCP/DNS an attacker
+controls (café Wi-Fi, a rogue access point) the attacker can answer that name
+with `10.41.1.50` and listen on those ports. The client then treats the
+network as the facility and points tools at the attacker over plain HTTP:
+
+- pip / uv get the attacker's index **and** the `trusted-host` /
+  `allow-insecure-host` bypass;
+- npm gets the attacker's registry;
+- Docker's `registry-mirrors` / `insecure-registries` entries are never
+  removed off-site (see below), so the same DNS answer re-activates them
+  without the client doing anything.
+
+The next `pip install` / `npm install` can then run attacker code as that
+user, and the next `docker pull` of a mirrored image can return an image of
+the attacker's choosing. "Off-site the name does not
+resolve" protects against honest networks, not hostile ones. No code in this
+client mitigates this today. The remedy is the TLS plan in
+[`HTTPS.md`](HTTPS.md) — a public certificate on the cache host and the HTTP
+bypasses removed, so a spoofed host fails the TLS check — and it is **not
+shipped**. apt is not affected in the same way (signatures, below).
 
 ## Integrity, package by package
 
-- **apt** — untouched. `Acquire::http::Proxy-Auto-Detect` only changes *where*
-  packages are fetched from; APT's own GPG signature verification of
-  `Release`/`Packages` still runs regardless of proxy. A compromised cache
-  cannot push an unsigned or mis-signed `.deb`.
+- **apt** — `Acquire::http::Proxy-Auto-Detect` only changes *where*
+  packages are fetched from; APT verifies `InRelease` against the keyring a
+  source is `signed-by`, and every `.deb` against the hashes that file
+  covers, whoever serves the bytes. That holds only while the keyring itself
+  did not come from the party being distrusted. The Ubuntu archive keys ship
+  with the OS. The GitHub CLI keyring
+  (`/etc/apt/keyrings/facility-cache-githubcli.gpg`) is fetched **only** from
+  `https://cli.github.com` (HTTPS, never through the cache) and installed only
+  if every primary key in it matches GitHub's published fingerprints, which
+  are pinned in `linux/lib/ensure_gh.sh`; a keyring that fails the pin is
+  removed. With the trust anchor fetched out-of-band and pinned, the `gh`
+  packages themselves may transit the cache. (Earlier releases fetched that
+  keyring through the cache over HTTP, so a hostile or spoofed cache could
+  have supplied its own key.)
 - **pip / uv** — the `trusted-host` / `allow-insecure-host` bypass (needed
   because the cache serves plain HTTP) is written by `facility-cache-apply`
-  *only* while the LAN probe confirms we're on-site (DNS matches
-  `10.41.1.50` **and** the pypi port answers). Off-site, those files and
-  env vars are removed. The insecure-TLS window is gated to exactly when the
-  cache is actually reachable, not left on unconditionally.
+  *only* while the probe says we're on-site (DNS answers `10.41.1.50`
+  **and** the pypi port answers), and removed otherwise. pip does not verify
+  package signatures; only lockfile hashes (`--require-hashes`) protect a
+  project against a malicious index. The probe is spoofable (above).
+- **npm** — same gating and the same caveat as pip.
 - **Docker** — `registry-mirrors` and `insecure-registries` in `daemon.json`
-  are **not** LAN-gated like pip/npm are: they're written once at install
-  time and stay in place regardless of current network. That's intentional,
-  not an oversight — toggling them would require a Docker daemon restart on
-  every network change, which this repo explicitly avoids. It's safe because
-  the entries only *name* the facility hostname; off-site that hostname does
-  not resolve in public DNS, so the insecure-registry config is inert
-  (fails closed via DNS) rather than actively insecure off the LAN.
+  are **not** probe-gated: they're written at install/update time and stay
+  in place on every network, because toggling them would mean restarting
+  dockerd on every network change. On an honest network off-site the name
+  does not resolve and Docker falls back to Docker Hub. On a network that
+  answers the name (spoofed, above) the mirror is used over plain HTTP.
+  Pin images by digest where it matters.
 
-## Self-update authenticity
+## Self-update: what is verified, and in what order
 
-The daily update timer always verifies the downloaded release tarball/zip
-against the SHA-256 in `manifest.json` before installing — that check is
-unconditional and always enforced. First-install bootstrap
-(`install-linux.sh` / `install-windows.ps1`) does the same for the archive
-it downloads.
+Clients download releases from this repo's GitHub Releases
+(`innovationtreehouse/infra.cache`, numeric id `1343160243`; formerly
+`innovationtreehouse/cache`). Each client pins the numeric repo id and refuses
+to update if the name now points at a different repository.
 
-`release.yml` attests **every file it publishes** with GitHub Artifact
-Attestations (`actions/attest-build-provenance`):
+Two checks, which do different jobs:
+
+1. **sha256 against `manifest.json`** — integrity only. It proves the archive
+   is the one the *same release's* manifest names. Anyone able to publish the
+   release can publish a matching manifest, so it says nothing about who
+   built it.
+2. **GitHub Artifact Attestation** — authenticity. It proves the bytes were
+   produced by this repo's `.github/workflows/release.yml` on a GitHub-hosted
+   runner, not hand-uploaded onto a Release.
+
+Both updaters (`linux/sbin/facility-cache-update`, `windows/FacilityCache.psm1`)
+and both bootstraps (`linux/bootstrap.sh`, `windows/Install-FromGitHub.ps1`)
+run both checks **before anything from the download is executed or
+extracted**. When `gh` is available (it is installed from GitHub directly if
+missing — never from the archive under test), a missing or failing
+attestation is **fatal**: nothing is installed. Only when `gh` cannot be
+installed does the client fall back to sha256 alone, and it logs that loudly
+as a warning on every run. A fleet machine stuck in that state is trusting
+whoever can publish a release.
+
+`release.yml` attests **every file it publishes**:
 
 - `facility-cache-client-linux.tar.gz`
 - `facility-cache-client-windows.zip`
@@ -64,97 +112,90 @@ Attestations (`actions/attest-build-provenance`):
 - `install-linux.sh`
 - `install-windows.ps1`
 
-That is a Sigstore-backed record that those bytes were produced by this
-repo's `release.yml` on a GitHub-hosted runner, not hand-uploaded onto a
-Release. Clients with `gh` then verify the downloaded archive in two steps:
+The client verifies in two steps, so no `gh auth login` is needed:
 
-1. Fetch every attestation for the file's SHA-256 from the **public**
-   GitHub attestations API — no credentials of any kind required for a
-   public repo:
+1. Fetch every attestation for the file's SHA-256:
 
    ```
-   GET https://api.github.com/repos/innovationtreehouse/cache/attestations/sha256:<sha256 of FILE>
+   GET https://api.github.com/repos/innovationtreehouse/infra.cache/attestations/sha256:<sha256 of FILE>
    ```
 
-   Write each returned `attestations[i].bundle` out as its own line of a
-   JSON Lines file (`gh attestation verify --bundle` accepts one bundle
-   object per line). As cheap extra hardening, any attestation whose own
-   `repository_id` doesn't match the pinned numeric repo id is dropped
-   before this step, when that id is known.
-2. Verify that bundle file without any further GitHub API calls and
-   without a `gh login` — `gh` still consults Sigstore's public TUF root
-   over the network the first time its local cache is cold, so "offline"
-   here means no GitHub API/auth dependency, not "no network at all":
+   Write each returned `attestations[i].bundle` as its own line of a JSON
+   Lines file (`gh attestation verify --bundle` accepts one bundle per line).
+   Attestations whose `repository_id` doesn't match the pinned repo id are
+   dropped first.
+2. Verify that bundle file locally (`gh` still fetches Sigstore's TUF root
+   when its cache is cold, so this needs network, but no GitHub login):
 
    ```
-   gh attestation verify FILE --repo innovationtreehouse/cache \
+   gh attestation verify FILE --repo innovationtreehouse/infra.cache \
      --bundle bundle.jsonl \
-     --signer-workflow innovationtreehouse/cache/.github/workflows/release.yml \
+     --signer-workflow innovationtreehouse/infra.cache/.github/workflows/release.yml \
      --deny-self-hosted-runners
    ```
 
-**This document and this client used to call the bare
-`gh attestation verify FILE --repo ... --signer-workflow ...` form
-directly (no `--bundle`) — that was wrong.** That form always requires an
-authenticated `gh` (`gh auth login`, or `GH_TOKEN`/`GITHUB_TOKEN` set) even
-against a fully public repo. The updater runs unattended as SYSTEM
-(Windows scheduled task) / root (systemd), which is never `gh auth login`'d,
-so it was silently exiting 4 ("please run: gh auth login") on every single
-run and quietly falling back to SHA-256-only — the "attestation
-unavailable" warning fired unconditionally and nobody could tell from the
-logs. The two-step bundle form above is what the client actually runs now,
-and it genuinely requires zero credentials. If a token happens to be
-configured (`github-token` file, `GITHUB_TOKEN` env var, or `GitHubToken`
-in Windows `config.json`), it is attached only to the bundle-fetch GET in
-step 1, purely to lift GitHub's unauthenticated 60 requests/hour/IP rate
-limit on that endpoint — it is never required and never gates whether
-verification runs.
+**Repo rename and manual verification.** A signing certificate records the
+repository name at build time. `v1.0.3` (and earlier) was built before the
+rename, so verifying it by hand needs the **old** names —
+`--repo innovationtreehouse/cache` and
+`--signer-workflow innovationtreehouse/cache/.github/workflows/release.yml`
+(GitHub redirects API calls made under the old name). Releases built after the rename
+need the new names, as shown everywhere else in these docs.
+
+The bare `gh attestation verify FILE --repo ... --signer-workflow ...` form
+(no `--bundle`) always needs an authenticated `gh`, even for a public repo.
+The unattended updater is never logged in, which is why the client uses the
+two-step form.
 
 `--signer-workflow` so a different workflow in the repo with
 `attestations: write` cannot satisfy the check.
 `--deny-self-hosted-runners` so only GitHub-hosted runners count.
 
-Both updaters (`linux/sbin/facility-cache-update`,
-`windows/FacilityCache.psm1`) and both bootstraps (`linux/bootstrap.sh`,
-`windows/Install-FromGitHub.ps1`) run that two-step check when `gh` is on
-PATH. It is a best-effort layer on top of SHA-256, not a replacement: if
-`gh` isn't installed, the bundle can't be fetched (offline, rate-limited,
-no attestation published, repo not public yet), or the `gh` call fails for
-any reason, the client logs a warning and falls back to SHA-256 alone, so
-a fleet without `gh` (or without network access to GitHub's attestations
-API) never bricks. A hard-fail mode (refuse to install without a verified
-attestation) is a deliberate future option once attestations have been
-live long enough to trust as a hard gate.
+`windows/Install-FromGitHub.ps1` carries its own copy of the verifier rather
+than importing it from the release zip it is verifying: sourcing the checker
+from the archive under test would let a malicious release ship a check that
+always passes. That duplication is intentional. `linux/bootstrap.sh` has the
+check inline for the same reason.
 
-`windows/Install-FromGitHub.ps1` carries its own copy of the verifier
-(~35 duplicated lines) rather than importing it from the release zip it is
-verifying: sourcing the checker from the archive under test would let a
-malicious release ship a module whose check always passes, or omit it to
-skip verification entirely. That duplication is intentional. The bundle
-check there also runs before the zip is ever extracted or its module
-imported, for the same reason. `linux/bootstrap.sh` doesn't have that
-problem the same way — its check is inline shell/Python from the start,
-not sourced from the tarball.
+## Public vs private repo
 
-Free GitHub Artifact Attestations require the repo to be **public** (or GitHub
-Enterprise Cloud with the add-on). If `innovationtreehouse/cache` ever goes
-private, re-check this before assuming attestation verification still works.
+The repo is **private** at the time of writing; whether it goes public again
+is an open decision. The client works in both states, but not the same way:
+
+| | Public | Private |
+|---|---|---|
+| Release list / asset download | no credentials | read token required (404 without one) |
+| Attestations API | no credentials | read token required (404 without one) |
+| `release.yml` can create attestations | yes | **no** on the GitHub Team plan (needs Enterprise Cloud) — the attest step fails, so no release can be published |
+| `release` environment required reviewers | available | not available on Team |
+
+While the repo is private each client needs a token with read access to this
+repo's contents and attestations (a fine-grained token: Contents read,
+Attestations read). Put it only in the root-only token file:
+
+- Linux: `/etc/facility-cache/github-token`, mode `600`, owner root
+- Windows: `C:\ProgramData\FacilityCache\github-token`, with its ACL
+  restricted to SYSTEM and Administrators
+
+**Never put a token in `/etc/facility-cache/config` or Windows
+`config.json`** — those are world-readable. When the repo is public no token
+is needed; a token file that exists is still sent on every GitHub call, so
+delete a stale one.
 
 ## GitHub CLI on client machines
 
 Bootstrap, `install.sh`, and the daily updater **install `gh` if it is
 missing** and **upgrade it** when a newer version is in GitHub's apt repo
-(Ubuntu) or winget / GitHub Releases (Windows). Attestation stays
-warn-only if that install fails, so a machine without `gh` is weaker, not
-bricked.
+(Ubuntu) or winget / GitHub Releases (Windows), because `gh` is what makes
+attestation verification possible (and therefore mandatory).
 
-Ubuntu uses GitHub's apt repository (GPG keyring under
-`/etc/apt/keyrings/facility-cache-githubcli.gpg`), not Ubuntu universe
-(too old for `--signer-workflow`) and not `curl | bash`. On the facility
-LAN the source line is rewritten through apt-cacher-ng:
+Ubuntu uses GitHub's apt repository with the pinned keyring described under
+*apt* above, not Ubuntu universe (too old for `--signer-workflow`) and not
+`curl | bash`. On the facility LAN the source line is rewritten through
+apt-cacher-ng:
 
 ```
-http://cache.facility.innovationtreehouse.org:3142/https://cli.github.com/packages
+http://cache.facility.innovationtreehouse.org:3142/cli.github.com/packages
 ```
 
 `facility-apt-proxy` returns `DIRECT` for URLs already aimed at the cache
@@ -163,34 +204,58 @@ host so that rewrite is not double-proxied. Off-site the source is
 the URL; install/update/bootstrap run `apt-get install gh`.
 
 Windows: `winget install`/`upgrade GitHub.cli`, falling back to the
-`windows_amd64.msi` from `cli/cli` releases. There is no apt-cacher-ng
-equivalent for that path.
+`windows_amd64.msi` from `cli/cli` releases.
 
 Uninstall removes the apt source and keyring this client wrote; it does
 not remove `gh` itself.
 
-No `gh auth login` is required for this public repo — the client only
-ever calls `gh attestation verify` in the two-step `--bundle` form
-described above, which needs no login. **The bare
-`gh attestation verify FILE --repo ... --signer-workflow ...` form shown
-in older docs, or run ad hoc by a human, does need `gh auth login` /
-`GH_TOKEN` first** — that requirement is a property of the bare form
-itself, not of this repo being public. See `README.md` for the two-step
-commands to run that ad hoc check without logging in.
-
-Recommended first install still verifies `install-linux.sh` /
-`install-windows.ps1` **before** executing them — that needs a `gh`
-already on PATH. `curl | sudo bash` cannot do that; it installs `gh`
-from the tarball, then attests the archive. See `README.md`.
+The recommended first install verifies `install-linux.sh` /
+`install-windows.ps1` **before** executing them, which needs a `gh` already
+on PATH. `curl | sudo bash` cannot do that; see `README.md`.
 
 ## Release-publishing controls
 
-`release.yml` only publishes from a `vX.Y.Z` tag ref whose value matches
-`VERSION` — a plain `workflow_dispatch` from a branch can no longer publish
-unguarded (see the workflow for the exact guard).
+Anyone who can get a release published here gets root/SYSTEM on every client
+at its next daily update. `release.yml` publishes only when all of these hold:
 
-That guard controls *what* gets published; it doesn't control *who* can push
-a matching tag. Restricting who may push tags matching `v*` is a **GitHub
-repository ruleset** (Settings → Rules → Rulesets → tag ruleset, or the
-equivalent API), not a file in this repo. Apply one before treating tag-push
-as a trusted release trigger.
+- the run is for a tag ref `vMAJOR.MINOR.PATCH` (a tag push, or a
+  `workflow_dispatch` run against that tag to retry a failed run) — the tag is
+  the version, there is no `VERSION` file in the repo;
+- the tagged commit is already on `main`;
+- the `lint` and `test` jobs pass on that commit;
+- the job is allowed to run in the `release` environment (gates nothing until
+  the environment is configured — see the checklist);
+- no **published** release exists for that tag: assets are never overwritten.
+  The workflow uploads to a draft, checks the draft holds exactly the attested
+  files (by SHA-256), checks the tag still points at the built commit, and only
+  then publishes. A leftover draft from a failed run is deleted and rebuilt;
+  builds are reproducible, so a retry yields the same hashes.
+
+Those gates control *what* gets published. *Who* can trigger them is GitHub
+configuration, not files in this repo, and is the stronger control.
+
+### Operator checklist — NOT yet applied
+
+State observed via read-only `gh api` on 2026-11-14:
+
+1. **Tag ruleset** — a ruleset named `v*` exists (id 21301233) with rules
+   creation/update/deletion/non-fast-forward, but enforcement is **disabled**,
+   its target list is **empty** (it matches no refs; the name is only a label)
+   and it has no bypass actors. Set *include* to `refs/tags/v*`, add the
+   release managers (a team) as bypass actors, and set enforcement to
+   **active**. Until then any collaborator with write access can push a `v*`
+   tag, and move or delete one.
+2. **`main` protection** — required status checks `format`, `lint`, `test`
+   (strict) are on, but required approving reviews is **0** and
+   "include administrators" is **off**, so anyone with write (via admin) can
+   land on `main` unreviewed, and the main-ancestry gate then means nothing.
+   Require ≥1 approving review, dismiss stale approvals, and include admins.
+3. **Org 2FA** — `two_factor_requirement_enabled` is **false** for the
+   `innovationtreehouse` org. Require it.
+4. **Collaborators** — five direct collaborators, all **admin**. Reduce to the
+   people who need it; admins can bypass every control above.
+5. **`release` environment** — does not exist yet (GitHub creates it,
+   unprotected, on the first run). Create it, restrict deployment tags to
+   `v*`, and add required reviewers. Required reviewers are only available to
+   private repos on GitHub Enterprise; on the Team plan they work only while
+   the repo is public.

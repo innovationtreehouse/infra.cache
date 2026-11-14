@@ -2,6 +2,8 @@
 # Linux client end-to-end harness. Runs INSIDE the client container as root.
 # The repo is mounted read-only at /repo. The fake cache is reachable as
 # cache.facility.innovationtreehouse.org -> 172.28.0.50 on the fixture network.
+# ck takes the status of the preceding [ ] / pipeline test; SC2319 flags that intended use.
+# shellcheck disable=SC2319
 set -u
 PASS=0
 FAIL=0
@@ -24,9 +26,12 @@ FQDN=cache.facility.innovationtreehouse.org
 write_config() { # write_config [extra lines...]
   {
     printf 'EXPECTED_IP=%s\n' "$EXP_IP"
-    [ -n "${GITHUB_TOKEN:-}" ] && printf 'GITHUB_TOKEN=%s\n' "$GITHUB_TOKEN"
     for line in "$@"; do printf '%s\n' "$line"; done
   } >/etc/facility-cache/config
+  # A token never goes in the world-readable config.
+  if [ -n "${GITHUB_TOKEN:-}" ]; then
+    (umask 077 && printf '%s\n' "$GITHUB_TOKEN" >/etc/facility-cache/github-token)
+  fi
 }
 
 sec "T0 environment"
@@ -63,6 +68,15 @@ command -v gh >/dev/null
 ck "gh installed by install.sh (full-update fallback for empty apt lists)" $? "$(gh --version 2>/dev/null | head -1)"
 grep -q "$FQDN:3142" /etc/apt/sources.list.d/facility-cache-github-cli.list 2>/dev/null
 ck "gh apt source rewritten through cache (on-site)" $?
+KR=/etc/apt/keyrings/facility-cache-githubcli.gpg
+kr_pinned() { bash -c 'source /usr/local/lib/facility-cache/common.sh && source /usr/local/lib/facility-cache/ensure_gh.sh && github_cli_keyring_ok "$1"' _ "$KR"; }
+curl -fsS "http://$FQDN:3142/cli.github.com/packages/githubcli-archive-keyring.gpg" -o /tmp/cachekr
+! cmp -s /tmp/cachekr "$KR" && kr_pinned
+ck "gh keyring is GitHub's pinned one, not the one the cache serves" $?
+cp /tmp/cachekr "$KR"
+/usr/local/sbin/facility-cache-apply >/dev/null 2>&1
+! cmp -s /tmp/cachekr "$KR" && kr_pinned
+ck "hostile gh keyring already on disk is replaced" $?
 python3 -c "import json,sys; d=json.load(open('/etc/docker/daemon.json')); sys.exit(0 if d['registry-mirrors'][0]=='http://$FQDN:5000' and 'https://mirror.example.com' in d['registry-mirrors'] and d['debug'] is True and '$FQDN:5000' in d['insecure-registries'] and '$FQDN:5001' in d['insecure-registries'] else 1)"
 ck "daemon.json merged, foreign entries kept" $?
 [ -f /etc/docker/daemon.json.facility-cache.bak ]
@@ -162,6 +176,24 @@ systemctl is-failed --quiet facility-cache-apply.service
 [ $? -ne 0 ]
 ck "apply.service not failed" $?
 
+sec "T9b shared machine mode"
+write_config "SHARED_MACHINE=1"
+/usr/local/sbin/facility-cache-apply
+ck "shared apply exit 0" $?
+[ -x /usr/local/bin/treehouse-git ]
+ck "treehouse-git installed" $?
+git config --system --get-all include.path | grep -qxF /usr/local/lib/facility-cache/shared.gitconfig
+ck "system gitconfig includes shared.gitconfig" $?
+grep -q '^TREEHOUSE_SHARED_MACHINE=1' /run/facility-cache/env
+ck "env file flags shared machine" $?
+grep -q '^GH_CONFIG_DIR=' /etc/environment.d/60-facility-cache.conf
+ck "environment.d sets GH_CONFIG_DIR" $?
+write_config
+/usr/local/sbin/facility-cache-apply
+ck "non-shared apply exit 0" $?
+! git config --system --get-all include.path 2>/dev/null | grep -q shared.gitconfig
+ck "system gitconfig include removed" $?
+
 sec "T10 update: --check, repo-id pin refusal, then full update (real GitHub + attestation)"
 echo 1.0.0 >/usr/local/lib/facility-cache/VERSION
 facility-cache update --check >/tmp/upcheck 2>&1
@@ -176,7 +208,8 @@ ck "repo-id pin mismatch refuses (negative)" $? "$(grep -iEo 'refus[^\"]*|mismat
 write_config
 facility-cache update >/tmp/upfull 2>&1
 ck "full update exit 0" $? "$(tail -2 /tmp/upfull | head -1)"
-grep -Eq "verified" /tmp/upfull
+# Success line only ("attest  verified  repo id …"); a refusal reads "attest  <reason>".
+grep -Eq "attest +verified +repo id 1343160243, refs/tags/v" /tmp/upfull && ! grep -q "refusing to install" /tmp/upfull
 ck "attestation VERIFIED (no gh login)" $? "$(grep -E 'attest|verified|sha256 only' /tmp/upfull | tail -1)"
 V="$(cat /usr/local/lib/facility-cache/VERSION)"
 [ "$V" != "1.0.0" ]
@@ -189,6 +222,10 @@ facility-cache log --json >/dev/null 2>&1
 ck "facility-cache log --json" $?
 
 sec "T11 uninstall"
+# T10 installed the latest RELEASE, including its uninstaller; reinstall this
+# tree so T11 exercises the uninstaller under test.
+bash /opt/src/linux/install.sh >/dev/null 2>&1
+ck "reinstall from tree exit 0" $?
 facility-cache uninstall
 ck "uninstall exit 0" $?
 [ ! -e /usr/local/sbin/facility-cache-apply ] && [ ! -e /usr/local/bin/facility-cache ] && [ ! -d /usr/local/lib/facility-cache ]
@@ -202,6 +239,8 @@ python3 -c "import json,sys; d=json.load(open('/etc/docker/daemon.json')); sys.e
 ck "daemon.json restored from backup" $?
 [ -f /etc/docker/daemon.json.facility-cache.uninstalled ]
 ck "pre-restore snapshot kept" $?
+[ ! -e /usr/local/bin/treehouse-git ]
+ck "treehouse-git removed" $?
 [ -f /etc/facility-cache/config ]
 ck "local config left in place" $?
 [ ! -f /etc/xdg/pip/pip.conf ] && [ ! -f /etc/npmrc ]
