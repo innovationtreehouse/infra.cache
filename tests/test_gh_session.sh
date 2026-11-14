@@ -106,5 +106,29 @@ ln -s "$TMP/elsedir" "$S/gh"
 check symlinked-gh-dir-not-sent 0 "$([[ ! -s "$CURL_LOG" ]] && echo 0 || echo 1)"
 check symlinked-gh-dir-session-removed 0 "$([[ ! -e "$S" ]] && echo 0 || echo 1)"
 
+# Login prompt and shell hint: quiet unless shared, never run gh (stub logs calls).
+cat >"$TMP/bin/gh" <<'EOF2'
+#!/bin/bash
+echo "gh $*" >>"$GH_LOG"
+EOF2
+export GH_LOG="$TMP/gh.log"
+: >"$GH_LOG"
+rm -rf "$S"
+echo "SHARED_MACHINE=0" >"$TMP/config"
+check hint-silent-when-not-shared "" "$("$TG" hint)"
+check welcome-silent-when-not-shared "" "$("$TG" welcome </dev/null)"
+echo "SHARED_MACHINE=1" >"$TMP/config"
+check hint-no-session "Not signed in to GitHub. Run: treehouse-git signin" "$("$TG" hint)"
+fake_session "$(($(date +%s) + 2 * 3600 + 5 * 60 + 30))" "oauth_token: gho_faketoken123"
+echo octo >"$S/login"
+check hint-signed-in "Signed in to GitHub as octo (2h 5m left)" "$("$TG" hint)"
+check welcome-quiet-when-signed-in "" "$("$TG" welcome </dev/null)"
+check welcome-launch-quiet-when-signed-in "" "$(PATH="$TMP/bin:/usr/bin:/bin" "$TG" welcome --launch)"
+echo $(($(date +%s) - 10)) >"$S/expires"
+check hint-expired "Not signed in to GitHub. Run: treehouse-git signin" "$("$TG" hint)"
+out="$("$TG" welcome </dev/null)"
+check welcome-offers-signin 1 "$([[ "$out" == *"not signed in to GitHub"* ]] && echo 1 || echo 0)"
+check welcome-skip-on-eof-no-gh "" "$(cat "$GH_LOG")"
+
 echo "treehouse-git: $pass passed, $fail failed"
 [[ "$fail" -eq 0 ]]

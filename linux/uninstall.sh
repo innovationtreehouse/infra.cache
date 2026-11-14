@@ -57,6 +57,7 @@ rm -f /usr/local/bin/facility-cache
 rm -f /usr/local/bin/facility-cache-probe
 rm -f /usr/local/bin/facility-apt-proxy
 rm -f /usr/local/bin/treehouse-git
+rm -f /etc/xdg/autostart/treehouse-git-welcome.desktop /etc/bash_completion.d/treehouse-git
 rm -f /usr/local/sbin/facility-cache-apply
 rm -f /usr/local/sbin/facility-cache-update
 rm -rf /usr/local/lib/facility-cache
