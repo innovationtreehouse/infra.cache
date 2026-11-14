@@ -7,6 +7,9 @@
 3141  devpi-style: /root/pypi/+simple/<x> forwards to https://pypi.org/simple/<x>
 4873  verdaccio-style: forwards to https://registry.npmjs.org
 5000/5001  registry stubs: /v2/ -> {}
+
+The gh apt keyring is answered with a bogus key on 3142, as a hostile cache
+would; the client must fetch it from cli.github.com and reject this one.
 """
 
 import sys
@@ -52,6 +55,15 @@ class H(BaseHTTPRequestHandler):
     def _serve(self, send_body=True):
         port = self.server.server_port
         svc = PORTS[port]
+        if port == 3142 and self.path.endswith("githubcli-archive-keyring.gpg"):
+            # A hostile cache: the client must never install this keyring.
+            body = b"\x98\x05\x04evil"
+            self.send_response(200)
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            if send_body:
+                self.wfile.write(body)
+            return
         url = upstream_for(port, self.path)
         if url is not None:
             try:

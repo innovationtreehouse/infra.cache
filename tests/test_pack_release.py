@@ -8,6 +8,7 @@ import json
 import os
 import sys
 import tarfile
+import time
 import unittest
 import zipfile
 from pathlib import Path
@@ -135,6 +136,36 @@ class PackTest(unittest.TestCase):
             (self.dist / "install-windows.ps1").read_bytes(),
             (ROOT / "windows" / "Install-FromGitHub.ps1").read_bytes(),
         )
+
+    def test_tar_members_normalised(self):
+        mtime = pack_release.source_date_epoch()
+        with tarfile.open(self.dist / "facility-cache-client-linux.tar.gz") as tar:
+            for m in tar.getmembers():
+                self.assertEqual(
+                    (m.uid, m.gid, m.uname, m.gname), (0, 0, "root", "root")
+                )
+                self.assertEqual(m.mtime, mtime, m.name)
+                self.assertIn(m.mode, (0o755, 0o644), m.name)
+            modes = {m.name: m.mode for m in tar.getmembers()}
+        self.assertEqual(
+            modes[f"{self.prefix}/linux/sbin/facility-cache-update"], 0o755
+        )
+        self.assertEqual(modes[f"{self.prefix}/VERSION"], 0o644)
+
+    def test_two_builds_are_byte_identical(self):
+        def digests():
+            return {p.name: pack_release.sha256_file(p) for p in self.dist.iterdir()}
+
+        first = digests()
+        # Cross a second boundary so any leaked wall-clock time (gzip header,
+        # tar/zip member mtimes) would show up as a different hash.
+        time.sleep(1.1)
+        os.environ["FC_RELEASE_VERSION"] = self.version
+        try:
+            pack_release.main()
+        finally:
+            del os.environ["FC_RELEASE_VERSION"]
+        self.assertEqual(first, digests())
 
     def test_release_workflow_attests_every_published_asset(self):
         workflow = (ROOT / ".github/workflows/release.yml").read_text(encoding="utf-8")

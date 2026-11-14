@@ -25,6 +25,8 @@ LIB = PREFIX / "lib/facility-cache"
 TOKEN_FILE = ETC / "github-token"
 STATE_FILE = VAR / "state.json"
 UA_BASE = "facility-cache-client"
+DEFAULT_REPO = "innovationtreehouse/infra.cache"
+HAS_DATA_FILTER = hasattr(tarfile, "data_filter")
 
 _HERE = Path(__file__).resolve().parent
 for _p in (LIB, _HERE.parent / "lib"):
@@ -50,7 +52,18 @@ def load_shell_file(path: Path) -> dict[str, str]:
 
 def load_config() -> dict[str, str]:
     cfg = load_shell_file(LIB / "defaults")
-    cfg.update(load_shell_file(ETC / "config"))
+    local = load_shell_file(ETC / "config")
+    if local.get("GITHUB_TOKEN"):
+        try:
+            if (ETC / "config").stat().st_mode & 0o004:
+                print(
+                    f"WARNING: GITHUB_TOKEN is in world-readable {ETC / 'config'} — "
+                    f"move it to {TOKEN_FILE} (mode 600) and revoke it",
+                    file=sys.stderr,
+                )
+        except OSError:
+            pass
+    cfg.update(local)
     if TOKEN_FILE.is_file():
         token = TOKEN_FILE.read_text(encoding="utf-8").strip()
         if token:
@@ -117,14 +130,13 @@ def github_request(url: str, cfg: dict[str, str], accept: str | None = None) -> 
         return resp.read()
 
 
-def latest_release(cfg: dict[str, str]) -> dict:
-    repo = cfg.get("GITHUB_REPO", "innovationtreehouse/cache")
+def latest_release(cfg: dict[str, str], repo: str) -> dict:
     body = github_request(f"https://api.github.com/repos/{repo}/releases/latest", cfg)
     return json.loads(body.decode("utf-8"))
 
 
 def repo_identity(cfg: dict[str, str]) -> dict:
-    repo = cfg.get("GITHUB_REPO", "innovationtreehouse/cache")
+    repo = cfg.get("GITHUB_REPO", DEFAULT_REPO)
     body = github_request(f"https://api.github.com/repos/{repo}", cfg)
     return json.loads(body.decode("utf-8"))
 
@@ -136,7 +148,9 @@ def identity_verdict(pinned: str, meta: dict, repo: str) -> tuple[str, str]:
     name could silently serve someone else's releases. The numeric id is
     immutable: same id under a new name is a legitimate rename ("renamed");
     a different id means the name no longer points at our repository
-    ("mismatch") and nothing may be installed from it.
+    ("mismatch") and nothing may be installed from it. On "ok"/"renamed",
+    detail is the repo's current full_name: the only name attestation may be
+    checked against (a post-rename release is signed under the new name).
     """
     actual = meta.get("id")
     if str(actual) != pinned:
@@ -144,7 +158,7 @@ def identity_verdict(pinned: str, meta: dict, repo: str) -> tuple[str, str]:
     full = str(meta.get("full_name") or repo)
     if full != repo:
         return "renamed", full
-    return "ok", str(actual)
+    return "ok", full
 
 
 def asset_map(release: dict) -> dict[str, dict]:
@@ -228,13 +242,11 @@ def fetch_attestation_bundles(
 def verify_attestation(
     tar_path: Path, repo: str, token: str, repo_id: str = ""
 ) -> bool:
-    """Best-effort GitHub Artifact Attestation check. Never raises.
+    """GitHub Artifact Attestation check. Never raises; False on any failure.
 
-    Supply-chain nicety on top of the sha256 check above, not a replacement
-    for it: if the bundle(s) can't be fetched, `gh` is missing, or the call
-    fails for any reason, the caller just logs a warning and keeps trusting
-    sha256. A hard-fail flag (refuse to install without a verified
-    attestation) can come later once attestations have been live a while.
+    repo must be the full_name resolved AFTER the numeric repo-id pin matched.
+    The caller refuses to install on False whenever `gh` is available; only a
+    machine where gh cannot be installed falls back (loudly) to sha256.
 
     The bundle(s) are fetched with no credentials (see
     fetch_attestation_bundles) and verified fully offline via --bundle, so
@@ -305,35 +317,18 @@ def load_manifest(release: dict, cfg: dict[str, str]) -> dict:
     return json.loads(raw.decode("utf-8"))
 
 
-def ensure_github_cli(tar_path: Path | None, ui: Ui) -> None:
-    """Install/upgrade gh. Best-effort, never raises.
+def ensure_github_cli(ui: Ui) -> None:
+    """Install/upgrade gh with the INSTALLED helper. Best-effort, never raises.
 
-    When tar_path is set (a newly downloaded release), run that tarball's
-    helper so a first upgrade onto this feature still works. Otherwise use
-    the installed /usr/local/sbin/facility-cache-ensure-gh.
+    Never the helper from a newly downloaded tarball: nothing from it may run
+    before it has been verified (and a hostile one could fake `gh` itself).
     """
     ui.step("gh", "GitHub CLI")
-    script = None
-    tmp: tempfile.TemporaryDirectory[str] | None = None
+    script = Path("/usr/local/sbin/facility-cache-ensure-gh")
+    if not script.is_file():
+        ui.warn("gh helper missing — continuing")
+        return
     try:
-        if tar_path is not None and tar_path.is_file():
-            tmp = tempfile.TemporaryDirectory(prefix="facility-cache-gh-")
-            with tarfile.open(tar_path, "r:gz") as tar:
-                try:
-                    tar.extractall(tmp.name, filter="data")
-                except TypeError:
-                    tar.extractall(tmp.name)
-            for root, _dirs, files in os.walk(tmp.name):
-                if "facility-cache-ensure-gh" in files:
-                    script = Path(root) / "facility-cache-ensure-gh"
-                    break
-        if script is None:
-            installed = Path("/usr/local/sbin/facility-cache-ensure-gh")
-            if installed.is_file():
-                script = installed
-        if script is None:
-            ui.warn("gh helper missing — continuing")
-            return
         proc = subprocess.run(
             ["bash", str(script)],
             check=False,
@@ -345,21 +340,38 @@ def ensure_github_cli(tar_path: Path | None, ui: Ui) -> None:
             ver = (proc.stdout or "").strip().splitlines()
             ui.step_ok("gh", ver[0] if ver else "installed")
         else:
-            ui.warn("gh install skipped — attestations may be unavailable")
-    except (OSError, tarfile.TarError, subprocess.TimeoutExpired):
-        ui.warn("gh install skipped — attestations may be unavailable")
-    finally:
-        if tmp is not None:
-            tmp.cleanup()
+            err = (proc.stderr or "").strip().splitlines()
+            ui.warn("gh install failed" + (f": {err[-1]}" if err else ""))
+    except (OSError, subprocess.TimeoutExpired):
+        ui.warn("gh install failed")
+
+
+def safe_extract(tar: tarfile.TarFile, dest: str) -> None:
+    """extractall, refusing anything that could land outside dest.
+
+    Uses the "data" filter where tarfile has it (3.12+, and backported to
+    3.8.17/3.9.17/3.10.12/3.11.4). Otherwise only plain files and directories
+    with relative, ..-free names are allowed (release tarballs contain nothing
+    else), with ownership and mode bits sanitized the same way.
+    """
+    if HAS_DATA_FILTER:
+        tar.extractall(dest, filter="data")
+        return
+    members = tar.getmembers()
+    for m in members:
+        parts = Path(m.name).parts
+        if not (m.isfile() or m.isdir()) or m.name.startswith("/") or ".." in parts:
+            raise tarfile.TarError(f"refusing unsafe tar member {m.name!r}")
+        m.mode &= 0o755
+        m.uid = m.gid = 0
+        m.uname = m.gname = ""
+    tar.extractall(dest, members=members)
 
 
 def install_tarball(tar_path: Path) -> None:
     with tempfile.TemporaryDirectory(prefix="facility-cache-") as tmp:
         with tarfile.open(tar_path, "r:gz") as tar:
-            try:
-                tar.extractall(tmp, filter="data")
-            except TypeError:
-                tar.extractall(tmp)
+            safe_extract(tar, tmp)
         installer = None
         for root, _dirs, files in os.walk(tmp):
             if "install.sh" in files and Path(root).name == "linux":
@@ -393,13 +405,29 @@ def main() -> int:
         return 1
 
     cfg = load_config()
-    repo = cfg.get("GITHUB_REPO", "innovationtreehouse/cache")
+    repo = cfg.get("GITHUB_REPO", DEFAULT_REPO)
     auto = cfg.get("AUTO_UPDATE", "1").lower() not in ("0", "false", "no", "off")
     ui.kv("repo", repo, "work")
     ui.kv("installed", local, "ok")
 
     pinned = cfg.get("GITHUB_REPO_ID", "").strip()
-    if pinned:
+    if not pinned:
+        # The id pin is what ties GITHUB_REPO (and the name attestation is
+        # checked against) to our repository; a name alone proves nothing.
+        if not args.check:
+            write_state(
+                {
+                    "installed_version": local,
+                    "last_result": "refused: no GITHUB_REPO_ID",
+                }
+            )
+            ui.fail(
+                "GITHUB_REPO_ID is not set — refusing to update from an unpinned name"
+            )
+            ui.finish(False, "refusing to update")
+            return 1
+        ui.warn("GITHUB_REPO_ID is not set — an update would be refused")
+    else:
         ui.step("identity", f"repo id {pinned}")
         try:
             meta = repo_identity(cfg)
@@ -431,11 +459,13 @@ def main() -> int:
                 f"repo renamed to {detail} — update GITHUB_REPO in /etc/facility-cache/config"
             )
         else:
-            ui.step_ok("identity", f"id {detail}")
+            ui.step_ok("identity", f"id {pinned}")
+        # From here on, only the pinned repository's current name is used.
+        repo = detail
 
     ui.step("github", "latest release")
     try:
-        release = latest_release(cfg)
+        release = latest_release(cfg, repo)
     except urllib.error.HTTPError as exc:
         if not args.check:
             write_state(
@@ -504,7 +534,7 @@ def main() -> int:
             }
         )
         ui.ok("already up to date")
-        ensure_github_cli(None, ui)
+        ensure_github_cli(ui)
         ui.finish(True, f"v{local}")
         return 0
 
@@ -556,15 +586,30 @@ def main() -> int:
             return 1
         ui.step_ok("verify", digest[:12] + "…")
 
-        ensure_github_cli(tar_path, ui)
+        ensure_github_cli(ui)
 
+        # sha256 came from this same release's manifest: integrity, not
+        # authenticity. With gh present the attestation is mandatory.
         ui.step("attest", "build provenance")
-        if verify_attestation(
-            tar_path, repo, cfg.get("GITHUB_TOKEN", ""), cfg.get("GITHUB_REPO_ID", "")
-        ):
+        result = "updated"
+        if not shutil.which("gh"):
+            result = "updated (sha256 only: gh unavailable, attestation NOT verified)"
+            ui.warn(
+                "gh unavailable — attestation NOT verified, installing on sha256 only"
+            )
+        elif verify_attestation(tar_path, repo, cfg.get("GITHUB_TOKEN", ""), pinned):
             ui.step_ok("attest", "verified")
         else:
-            ui.warn("attestation unavailable — continuing on sha256 only")
+            write_state(
+                {
+                    "installed_version": local,
+                    "latest_version": remote,
+                    "last_result": f"refused: attestation missing or invalid for {tag} ({repo})",
+                }
+            )
+            ui.step_fail("attest", f"not verified against {repo} release.yml")
+            ui.finish(False, "refusing to install")
+            return 1
 
         ui.step("install", f"v{remote}")
         install_tarball(tar_path)
@@ -577,7 +622,7 @@ def main() -> int:
         {
             "installed_version": remote,
             "latest_version": remote,
-            "last_result": "updated",
+            "last_result": result,
             "from_tag": tag,
         }
     )

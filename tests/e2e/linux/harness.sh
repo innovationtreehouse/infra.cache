@@ -26,9 +26,12 @@ FQDN=cache.facility.innovationtreehouse.org
 write_config() { # write_config [extra lines...]
   {
     printf 'EXPECTED_IP=%s\n' "$EXP_IP"
-    [ -n "${GITHUB_TOKEN:-}" ] && printf 'GITHUB_TOKEN=%s\n' "$GITHUB_TOKEN"
     for line in "$@"; do printf '%s\n' "$line"; done
   } >/etc/facility-cache/config
+  # A token never goes in the world-readable config.
+  if [ -n "${GITHUB_TOKEN:-}" ]; then
+    (umask 077 && printf '%s\n' "$GITHUB_TOKEN" >/etc/facility-cache/github-token)
+  fi
 }
 
 sec "T0 environment"
@@ -65,6 +68,15 @@ command -v gh >/dev/null
 ck "gh installed by install.sh (full-update fallback for empty apt lists)" $? "$(gh --version 2>/dev/null | head -1)"
 grep -q "$FQDN:3142" /etc/apt/sources.list.d/facility-cache-github-cli.list 2>/dev/null
 ck "gh apt source rewritten through cache (on-site)" $?
+KR=/etc/apt/keyrings/facility-cache-githubcli.gpg
+kr_pinned() { bash -c 'source /usr/local/lib/facility-cache/common.sh && source /usr/local/lib/facility-cache/ensure_gh.sh && github_cli_keyring_ok "$1"' _ "$KR"; }
+curl -fsS "http://$FQDN:3142/cli.github.com/packages/githubcli-archive-keyring.gpg" -o /tmp/cachekr
+! cmp -s /tmp/cachekr "$KR" && kr_pinned
+ck "gh keyring is GitHub's pinned one, not the one the cache serves" $?
+cp /tmp/cachekr "$KR"
+/usr/local/sbin/facility-cache-apply >/dev/null 2>&1
+! cmp -s /tmp/cachekr "$KR" && kr_pinned
+ck "hostile gh keyring already on disk is replaced" $?
 python3 -c "import json,sys; d=json.load(open('/etc/docker/daemon.json')); sys.exit(0 if d['registry-mirrors'][0]=='http://$FQDN:5000' and 'https://mirror.example.com' in d['registry-mirrors'] and d['debug'] is True and '$FQDN:5000' in d['insecure-registries'] and '$FQDN:5001' in d['insecure-registries'] else 1)"
 ck "daemon.json merged, foreign entries kept" $?
 [ -f /etc/docker/daemon.json.facility-cache.bak ]

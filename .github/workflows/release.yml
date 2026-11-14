@@ -1,19 +1,39 @@
 name: Release
 
+# Whoever can publish a release here gets root/SYSTEM on every client machine
+# at its next daily update, so every gate below is a security control:
+#   1. the tag is vMAJOR.MINOR.PATCH and its commit is already on main
+#   2. lint and the unit tests pass on that commit (`needs:` on the release job)
+#   3. the release job runs in the `release` environment, where repo admins
+#      can require a reviewer (Settings -> Environments; not in this file)
+#   4. an existing published release is never modified: assets go onto a
+#      draft, are checked against what was built and attested, and only then
+#      is the draft published
+# workflow_dispatch exists only to retry a tag whose run failed half-way: it
+# must be run against the tag ref ("Use workflow from" -> the tag) and goes
+# through exactly the same gates. It cannot republish an existing release.
+
 on:
   push:
     tags:
       - "v*"
   workflow_dispatch:
 
+permissions: {}
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
 jobs:
-  # Non-blocking: shellcheck/PSScriptAnalyzer catch real issues but a lint nit
-  # should never hold up a release. No `needs:` on the release job on purpose.
   lint:
     runs-on: ubuntu-latest
-    permissions: {}
+    permissions:
+      contents: read
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
 
       - name: ShellCheck (preinstalled on ubuntu-latest)
         # Several scripts (linux/bin/*, facility-cache-apply) are bash but have
@@ -28,11 +48,34 @@ jobs:
       - name: PSScriptAnalyzer (pwsh preinstalled on ubuntu-latest)
         shell: pwsh
         run: |
-          Install-Module -Name PSScriptAnalyzer -Force -Scope CurrentUser
+          Install-Module -Name PSScriptAnalyzer -RequiredVersion 1.25.0 -Force -Scope CurrentUser
           Invoke-ScriptAnalyzer -Path windows -Recurse -EnableExit
 
-  release:
+  test:
     runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: python unit tests
+        run: python3 -m unittest discover -s tests -v
+      - name: shell self-check
+        run: |
+          bash tests/test_common.sh
+          bash tests/test_gh_session.sh
+
+  release:
+    # Gated on lint + tests: a release that fails them is not shipped to the
+    # fleet. (This used to be deliberately ungated; a lint nit holding up a
+    # release is the cheaper failure.)
+    needs: [lint, test]
+    runs-on: ubuntu-latest
+    # Required reviewers / tag policy are configured on this environment in
+    # repo settings. If it does not exist yet GitHub creates it on first use
+    # with no protection rules, so this line gates nothing until configured.
+    environment: release
     permissions:
       contents: write
       # Required by actions/attest-build-provenance to mint and record a
@@ -41,13 +84,13 @@ jobs:
       attestations: write
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          # Full history so origin/main is present for the ancestry check.
+          fetch-depth: 0
+          persist-credentials: false
 
-      # The tag IS the version — there is no VERSION file in the repo. Runs
-      # for both the tag push and workflow_dispatch: dispatch only publishes
-      # when it is run against a vX.Y.Z tag ref (pick that tag under "Use
-      # workflow from" when re-running), so a dispatch from a branch can
-      # never publish an unguarded release.
-      - name: Version from tag
+      # The tag IS the version — there is no VERSION file in the repo.
+      - name: Version from tag, tagged commit must be on main
         id: ver
         run: |
           if [[ "$GITHUB_REF" != refs/tags/v* ]]; then
@@ -60,16 +103,47 @@ jobs:
             echo "Tag $GITHUB_REF_NAME is not vMAJOR.MINOR.PATCH" >&2
             exit 1
           fi
+          if ! git merge-base --is-ancestor "$GITHUB_SHA" origin/main; then
+            echo "Tagged commit $GITHUB_SHA is not on main; refusing to release it." >&2
+            exit 1
+          fi
           echo "version=$VERSION" >> "$GITHUB_OUTPUT"
           echo "tag=$GITHUB_REF_NAME" >> "$GITHUB_OUTPUT"
+
+      # Never touch a published release. A draft for this tag can only be
+      # left over from a run that failed half-way (or was hand-made); it is
+      # not visible to clients, so delete it and rebuild from scratch. The
+      # build is reproducible, so a retry yields the same hashes.
+      - name: Refuse if already published; clear stale drafts
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ steps.ver.outputs.tag }}
+        run: |
+          gh api --paginate "repos/$GITHUB_REPOSITORY/releases?per_page=100" \
+            --jq '.[] | select(.tag_name == env.TAG) | "\(.id) \(.draft)"' > existing.txt
+          if grep -q ' false$' existing.txt; then
+            echo "Release $TAG is already published; refusing to modify it." >&2
+            echo "Cut a new patch version instead." >&2
+            exit 1
+          fi
+          while read -r id _; do
+            echo "Deleting stale draft release $id for $TAG"
+            gh api -X DELETE "repos/$GITHUB_REPOSITORY/releases/$id"
+          done < existing.txt
+          rm existing.txt
 
       - name: Pack assets
         env:
           FC_RELEASE_VERSION: ${{ steps.ver.outputs.version }}
-        run: python3 scripts/pack-release.py
+        run: |
+          SOURCE_DATE_EPOCH="$(git log -1 --format=%ct)"
+          export SOURCE_DATE_EPOCH
+          python3 scripts/pack-release.py
+          (cd dist && sha256sum -- *)
 
-      # Free Artifact Attestations require this repo to stay public (or a
-      # GitHub Enterprise Cloud plan with the add-on) — see docs/SECURITY.md.
+      # Artifact Attestations need this repo to be public, or GitHub Enterprise
+      # Cloud — on the Team plan this step fails while the repo is private,
+      # and so no release can be published. See docs/SECURITY.md.
       # Every file pack-release.py writes to dist/ is published below; attest
       # all of them so first-install bootstrap scripts and the manifest are
       # not unsigned siblings of the archives.
@@ -84,16 +158,30 @@ jobs:
             dist/install-linux.sh
             dist/install-windows.ps1
 
-      - name: Publish GitHub Release
+      - name: Upload to a draft, check it, publish
         env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ steps.ver.outputs.tag }}
         run: |
-          TAG="${{ steps.ver.outputs.tag }}"
-          if gh release view "$TAG" >/dev/null 2>&1; then
-            gh release upload "$TAG" dist/* --clobber
-          else
-            gh release create "$TAG" dist/* \
-              --title "$TAG" \
-              --generate-notes \
-              --target "${{ github.sha }}"
+          gh release create "$TAG" dist/* --draft --verify-tag \
+            --title "$TAG" --generate-notes
+          id="$(gh api --paginate "repos/$GITHUB_REPOSITORY/releases?per_page=100" \
+            --jq '.[] | select(.tag_name == env.TAG and .draft) | .id')"
+          if [[ ! "$id" =~ ^[0-9]+$ ]]; then
+            echo "Expected exactly one draft for $TAG, got: $id" >&2
+            exit 1
           fi
+          # The draft must hold exactly the attested files, byte for byte.
+          (cd dist && sha256sum -- *) | sort > built.txt
+          gh api "repos/$GITHUB_REPOSITORY/releases/$id" \
+            --jq '.assets[] | "\(.digest | ltrimstr("sha256:"))  \(.name)"' | sort > uploaded.txt
+          diff -u built.txt uploaded.txt
+          # The tag must still point at the commit that was checked and built.
+          now="$(gh api "repos/$GITHUB_REPOSITORY/commits/$TAG" --jq .sha)"
+          if [[ "$now" != "$GITHUB_SHA" ]]; then
+            echo "Tag $TAG moved to $now during the run (built $GITHUB_SHA)." >&2
+            exit 1
+          fi
+          gh api -X PATCH "repos/$GITHUB_REPOSITORY/releases/$id" \
+            -F draft=false -f make_latest=legacy >/dev/null
+          echo "Published $TAG"

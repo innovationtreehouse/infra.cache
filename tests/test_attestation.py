@@ -29,7 +29,7 @@ _spec = importlib.util.spec_from_loader("facility_cache_update", _loader)
 update = importlib.util.module_from_spec(_spec)
 _loader.exec_module(update)
 
-REPO = "innovationtreehouse/cache"
+REPO = "innovationtreehouse/infra.cache"
 
 
 def _fake_response(body: bytes):

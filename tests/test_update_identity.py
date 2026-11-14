@@ -21,7 +21,7 @@ spec = importlib.util.spec_from_loader("facility_cache_update", _loader)
 update = importlib.util.module_from_spec(spec)
 _loader.exec_module(update)
 
-REPO = "innovationtreehouse/cache"
+REPO = "innovationtreehouse/infra.cache"
 
 
 class TestIdentityVerdict(unittest.TestCase):
@@ -30,16 +30,18 @@ class TestIdentityVerdict(unittest.TestCase):
             "1343160243", {"id": 1343160243, "full_name": REPO}, REPO
         )
         self.assertEqual(verdict, "ok")
-        self.assertEqual(detail, "1343160243")
+        # detail is the resolved name attestation is checked against
+        self.assertEqual(detail, REPO)
 
     def test_matching_id_under_a_new_name_is_a_rename(self):
+        # An install still configured with the pre-rename name.
         verdict, detail = update.identity_verdict(
             "1343160243",
-            {"id": 1343160243, "full_name": "innovationtreehouse/facility-cache"},
-            REPO,
+            {"id": 1343160243, "full_name": REPO},
+            "innovationtreehouse/cache",
         )
         self.assertEqual(verdict, "renamed")
-        self.assertEqual(detail, "innovationtreehouse/facility-cache")
+        self.assertEqual(detail, REPO)
 
     def test_different_id_is_a_mismatch_even_with_the_expected_name(self):
         verdict, detail = update.identity_verdict(
@@ -60,6 +62,14 @@ class TestIdentityVerdict(unittest.TestCase):
 
         cfg = json.loads((ROOT / "defaults.json").read_text())
         self.assertEqual(cfg["GitHubRepoId"], 1343160243)
+
+    def test_linux_defaults_use_the_post_rename_name(self):
+        self.assertIn(f"GITHUB_REPO={REPO}\n", (ROOT / "defaults.env").read_text())
+        self.assertEqual(update.DEFAULT_REPO, REPO)
+        for rel in ("linux/lib/common.sh", "linux/bootstrap.sh"):
+            text = (ROOT / rel).read_text()
+            self.assertNotIn("innovationtreehouse/cache}", text, rel)
+            self.assertIn(REPO, text, rel)
 
 
 if __name__ == "__main__":
